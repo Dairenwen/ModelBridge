@@ -56,10 +56,10 @@ namespace modelBridge
     /// 一条文本消息；会话中的排列顺序即对话顺序。
     struct Message
     {
-        MessageRole role;                             ///< 消息角色。
-        std::string content;                          ///< UTF-8 文本内容。
-        std::int64_t createdAt = currentTimeMillis(); ///< 创建时间，Unix 毫秒。
-        std::string toolCallId;                       ///< Tool 消息关联的工具调用 ID，其他角色留空。
+        MessageRole role;       ///< 消息角色。
+        std::string content;    ///< UTF-8 文本内容。
+        std::int64_t createdAt; ///< 创建时间，Unix 毫秒。
+        std::string toolCallId; ///< Tool 消息关联的工具调用 ID，其他角色留空。
     };
 
     /// 模型的基本信息，不包含连接密钥。
@@ -69,6 +69,7 @@ namespace modelBridge
         std::string displayName; ///< 展示名称；为空时使用 modelName。
         ApiProtocol protocol;    ///< 使用的聊天协议。
         ProviderType provider;   ///< 服务平台；百炼和 DeepSeek 可共用兼容协议。
+        std::string description; ///< 可选的模型说明，供 Provider 查询和界面展示。
     };
 
     /**
@@ -84,20 +85,20 @@ namespace modelBridge
         std::string apiKeyEnv;              ///< 密钥环境变量名，apiKey 为空时由 Provider 读取。
         std::optional<double> temperature;  ///< 采样温度；未设置时使用服务端默认值。
         std::optional<int> maxOutputTokens; ///< 输出 Token 上限，设置时须大于零。
-        int timeoutSeconds = 120;           ///< 请求超时秒数，须大于零。
-        bool stream = false;                ///< 是否默认使用流式回复。
+        int timeoutSeconds;                 ///< 请求超时秒数，须大于零。
+        bool stream;                        ///< 是否默认使用流式回复。
         std::string apiKey;                 ///< 运行时直接传入的密钥
     };
 
     /// 一个聊天会话及其完整历史。
     struct Session
     {
-        std::string sessionId;                        ///< 会话唯一 ID。
-        std::string userId;                           ///< 所属用户 ID。
-        std::string modelConfigId;                    ///< 使用的 ModelConfig::configId。
-        std::string title;                            ///< 会话标题。
-        std::vector<Message> messages;                ///< 按对话顺序保存的历史，系统提示也作为消息保存。
-        std::int64_t createdAt = currentTimeMillis(); ///< 创建时间，Unix 毫秒。
+        std::string sessionId;         ///< 会话唯一 ID。
+        std::string userId;            ///< 所属用户 ID。
+        std::string modelConfigId;     ///< 使用的 ModelConfig::configId。
+        std::string title;             ///< 会话标题。
+        std::vector<Message> messages; ///< 按对话顺序保存的历史，系统提示也作为消息保存。
+        std::int64_t createdAt;        ///< 创建时间，Unix 毫秒。
     };
 
     /// 用户自己的基础配置。
@@ -109,13 +110,5 @@ namespace modelBridge
         std::string defaultSystemPrompt;       ///< 新会话的系统提示，由管理器加入首条 System 消息。
         std::string databasePath;              ///< SQLite 数据库文件路径。
     };
-
-    /**
-     * @brief 接收流式回复；所有片段按顺序拼接后得到完整文本。
-     * @param delta 本次新增文本，可为空；引用仅在回调期间有效。
-     * @param done 是否为本次回复的最后一次回调；先处理 delta，再处理结束标记。
-     * @return 无。
-     */
-    using StreamCallback = std::function<void(const std::string &delta, bool done)>;
 
 } // namespace modelBridge

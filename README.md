@@ -1,4 +1,3 @@
-
 # ModelBridge — C++ 多模型统一接入框架
 
 ## 1. 项目概述
@@ -283,87 +282,15 @@ if (apiKey == nullptr) {
 
 ### 5.1 ChatSDK 的职责
 
-ChatSDK 向上层提供统一接口，应用程序只需要使用 `ChatSDK` 类，就可以完成模型初始化、会话管理和消息发送。
-
-该模块的核心价值是：
-
-**将具体模型的访问逻辑封装在 SDK 内部，使业务层不必直接处理每家模型的 API 差异。**
-
 ### 5.2 ChatSDK 主要 API
 
-以下接口根据《附录3：ChatSDK使用手册》第 3.2 节整理。
-
-| 接口                                                | 返回类型                | 主要功能                       |
-| --------------------------------------------------- | ----------------------- | ------------------------------ |
-| `initModels(configs)`                             | `bool`                | 初始化模型                     |
-| `getAvailableModels()`                            | `vector<ModelInfo>`   | 获取支持的模型                 |
-| `createSession(modelName)`                        | `string`              | 为指定模型创建会话             |
-| `getSession(sessionId)`                           | `shared_ptr<Session>` | 根据 ID 查询会话               |
-| `getSessionList()`                                | `vector<string>`      | 获取会话列表                   |
-| `deleteSession(sessionId)`                        | `bool`                | 删除指定会话                   |
-| `sendMessage(sessionId, message)`                 | `string`              | 发送消息并获取完整响应         |
-| `sendMessageStream(sessionId, message, callback)` | `string`              | 发送消息并通过回调接收流式响应 |
-
-核心接口均由 SDK 提供，上层通过会话 ID 访问对应会话。附录3：ChatSDK使用手册
-
 ### 5.3 核心调用流程
-
-```text
-创建 ChatSDK 对象
-        ↓
-配置模型参数
-        ↓
-initModels()
-        ↓
-createSession()
-        ↓
-获取 sessionId
-        ↓
-sendMessage() / sendMessageStream()
-        ↓
-获取模型回复
-        ↓
-更新会话历史
-```
 
 ### 5.4 普通响应与流式响应
 
 #### 普通响应
 
-```cpp
-std::string response = chatSDK.sendMessage(
-    sessionId,
-    "你好，请介绍一下自己"
-);
-
-std::cout << response << std::endl;
-```
-
-模型生成完成后，一次性返回结果。
-
 #### 流式响应
-
-```cpp
-chatSDK.sendMessageStream(
-    sessionId,
-    "你好，请介绍一下自己",
-    [](const std::string& response, bool done) {
-        std::cout << response << std::flush;
-
-        if (done) {
-            std::cout << "\n消息接收完成" << std::endl;
-        }
-    }
-);
-```
-
-模型逐步生成内容时，通过回调函数接收输出。
-
-`done` 用于标识本次生成是否结束。
-
-**注意：** 回调中的字符串具体代表增量片段还是累计文本，应以当前 SDK 实现为准，不能仅根据接口名称判断。
-
----
 
 ## 6. 开发环境与项目构建
 
@@ -397,6 +324,7 @@ apt install -y \
     libspdlog-dev \
     libfmt-dev \
     libjsoncpp-dev \
+    libcurl4-openssl-dev \
     libgtest-dev \
     libssl-dev \
     libsqlite3-dev
@@ -1132,3 +1060,272 @@ choices[0].message.content
 - 原生 `/api/chat` 使用 `options.temperature` 等参数结构。
 - OpenAI 兼容接口使用 `temperature`、`max_tokens` 等兼容参数。
 - 兼容接口并不代表支持 OpenAI API 的全部功能。
+
+## 8. LLMProvider 封装的三种聊天协议
+
+本节对应 `SDK/include/LLMProvider.hpp` 和 `SDK/src/LLMProvider.cpp` 的当前实现。
+三种协议均通过 HTTP `POST` 发送 JSON，但请求路径、认证头、消息结构和流式格式不同。
+`baseUrl` 是服务根地址，`requestUrl` 是最终请求地址：
+
+```text
+requestUrl = baseUrl（去掉末尾 /）+ Provider 生成的路径
+```
+
+### 8.1 baseUrl 与请求 URL
+
+| 协议 / 服务                | baseUrl 示例                                          | 普通请求路径                        | 流式请求路径                                      |
+| -------------------------- | ----------------------------------------------------- | ----------------------------------- | ------------------------------------------------- |
+| OpenAI 兼容 / OpenAI       | `https://api.openai.com/v1`                         | `/chat/completions`               | `/chat/completions`                             |
+| OpenAI 兼容 / DeepSeek     | `https://api.deepseek.com`                          | `/chat/completions`               | `/chat/completions`                             |
+| OpenAI 兼容 / 百炼北京区域 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `/chat/completions`               | `/chat/completions`                             |
+| Gemini 原生                | `https://generativelanguage.googleapis.com/v1beta`  | `/models/{model}:generateContent` | `/models/{model}:streamGenerateContent?alt=sse` |
+| Ollama 原生                | `http://127.0.0.1:11434`                            | `/api/chat`                       | `/api/chat`                                     |
+
+例如，OpenAI 的完整地址是 `https://api.openai.com/v1/chat/completions`，
+DeepSeek 是 `https://api.deepseek.com/chat/completions`。
+百炼不同区域有不同地址，需要与 API Key 所属区域匹配。Ollama 的 `baseUrl` 若已包含末尾 `/api`，当前实现只追加 `/chat`，避免重复拼接。
+
+依据：[OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat)、[DeepSeek 接入说明](https://api-docs.deepseek.com/)、[百炼 OpenAI 兼容接口](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)。
+
+### 8.2 OpenAI 兼容协议
+
+对应 `OpenAICompatibleProvider` 和 `ApiProtocol::OpenAICompatible`。OpenAI、DeepSeek、百炼以及兼容此协议的中转服务可以共用该实现。
+
+**请求头**
+
+| 请求头            | 值                    | 说明                       |
+| ----------------- | --------------------- | -------------------------- |
+| `Content-Type`  | `application/json`  | 请求体为 JSON              |
+| `Authorization` | `Bearer <API_KEY>`  | 当前 Provider 要求提供密钥 |
+| `Accept`        | `application/json`  | 普通请求                   |
+| `Accept`        | `text/event-stream` | 流式请求                   |
+
+**请求体参数**
+
+| 参数                        | 是否必填          | 当前封装的含义                                                  |
+| --------------------------- | ----------------- | --------------------------------------------------------------- |
+| `model`                   | 是                | `ModelInfo::modelName`，请求使用的模型 ID                     |
+| `messages`                | 是                | 按顺序保存的完整上下文，不能为空                                |
+| `messages[].role`         | 是                | `system`、`user`、`assistant`；工具结果使用 `tool`      |
+| `messages[].content`      | 是                | 文本内容                                                        |
+| `messages[].tool_call_id` | Tool 消息需要     | 对应 `Message::toolCallId`，关联原工具调用                    |
+| `stream`                  | Provider 总是发送 | `sendMessage` 为 `false`，`sendMessageStream` 为 `true` |
+| `temperature`             | 否                | 配置了 `temperature` 才发送，包括显式的 `0`                 |
+| `max_completion_tokens`   | 否                | `provider == ProviderType::OpenAI` 时使用的输出上限字段       |
+| `max_tokens`              | 否                | 当前封装对其他兼容平台使用的输出上限字段                        |
+
+两种 Token 上限字段只发送一种；部分模型不支持温度等采样参数，可保持未设置。
+以下为 DeepSeek 等传统兼容接口的示例请求体：
+
+```json
+{
+  "model": "your-model-id",
+  "messages": [
+    {"role": "system", "content": "你是一名 C++ 开发工程师。"},
+    {"role": "user", "content": "解释 Reactor 模型。"}
+  ],
+  "stream": false,
+  "temperature": 0.7,
+  "max_tokens": 512
+}
+```
+
+**普通响应:**
+
+```json
+{
+  "id": "response-id",
+  "model": "your-model-id",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "Reactor 是一种事件驱动模型。"},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 20, "completion_tokens": 15, "total_tokens": 35}
+}
+```
+
+| 响应参数                       | 含义                                                        | 当前 SDK 的处理                              |
+| ------------------------------ | ----------------------------------------------------------- | -------------------------------------------- |
+| `choices[0].message.content` | 第一个候选回答的文本                                        | 作为返回字符串                               |
+| `choices[].finish_reason`    | 如 `stop`、`length`、`tool_calls`、`content_filter` | 长度截断保留已有文本；工具调用或内容拦截报错 |
+| `usage`                      | 输入、输出及总 Token 统计                                   | 当前文本接口不返回统计                       |
+| `id`、`model`              | 服务端响应 ID、实际模型                                     | 不作为回复文本返回                           |
+
+**流式响应：SSE**
+
+请求仍发往 `/chat/completions`，只需将 `stream` 设为 `true`。响应示意：
+
+```text
+data: {"choices":[{"delta":{"role":"assistant","content":"Reactor"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":" 是一种事件驱动模型。"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+可见文本位于 `choices[0].delta.content`，按增量拼接。角色事件或用量事件可以没有文本，不能因此判断响应结束。当前封装以 `[DONE]` 判断 OpenAI 兼容流已完整结束。
+
+### 8.3 Gemini 原生协议
+
+对应 `GeminiProvider` 和 `ApiProtocol::Gemini`。
+
+**请求地址及请求头**
+
+```text
+普通：POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+流式：POST https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse
+```
+
+模型名可配置为 `your-model-id` 或 `models/your-model-id`；Provider 会统一处理前缀并编码路径段。
+
+| 请求头             | 值                                                            |
+| ------------------ | ------------------------------------------------------------- |
+| `Content-Type`   | `application/json`                                          |
+| `x-goog-api-key` | `<GEMINI_API_KEY>`，当前封装放在请求头中，不拼进 URL        |
+| `Accept`         | 普通请求为 `application/json`；流式为 `text/event-stream` |
+
+**请求体参数**
+
+| 参数                                 | 是否必填     | 当前封装的含义                                   |
+| ------------------------------------ | ------------ | ------------------------------------------------ |
+| `contents`                         | 是           | 用户及模型的对话历史，至少包含一条非 System 消息 |
+| `contents[].role`                  | 当前封装发送 | User 映射为 `user`，Assistant 映射为 `model` |
+| `contents[].parts[].text`          | 文本请求需要 | 一条消息的文本内容                               |
+| `systemInstruction.parts[].text`   | 否           | System 消息放在这里，不放入 `contents`         |
+| `generationConfig.temperature`     | 否           | 采样温度                                         |
+| `generationConfig.maxOutputTokens` | 否           | 输出 Token 上限                                  |
+
+Gemini 的模型名位于 URL 中，原生请求体不添加 OpenAI 风格的 `model`、`messages` 或 `stream`。
+连续同角色消息在当前实现中合并为同一条内容的多个 parts。
+
+```json
+{
+  "systemInstruction": {
+    "parts": [{"text": "你是一名 C++ 开发工程师。"}]
+  },
+  "contents": [
+    {"role": "user", "parts": [{"text": "解释 Reactor 模型。"}]}
+  ],
+  "generationConfig": {"temperature": 0.7, "maxOutputTokens": 512}
+}
+```
+
+**普通响应**
+
+```json
+{
+  "candidates": [
+    {
+      "index": 0,
+      "content": {
+        "role": "model",
+        "parts": [{"text": "Reactor 是一种事件驱动模型。"}]
+      },
+      "finishReason": "STOP"
+    }
+  ],
+  "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 15, "totalTokenCount": 35}
+}
+```
+
+| 响应参数                               | 含义                     | 当前 SDK 的处理                                       |
+| -------------------------------------- | ------------------------ | ----------------------------------------------------- |
+| `candidates[0].content.parts[].text` | 第一个候选回答的文本片段 | 按顺序拼接，不包含 `thought: true` 的片段           |
+| `candidates[0].finishReason`         | 生成结束原因             | 接受 `STOP`、`MAX_TOKENS`；其他非空原因按失败处理 |
+| `promptFeedback.blockReason`         | 输入被拦截的原因         | 抛出异常                                              |
+| `usageMetadata`                      | Token 使用情况           | 当前文本接口不返回统计                                |
+
+**流式响应：SSE**
+
+使用 `:streamGenerateContent?alt=sse`，每个 SSE `data:` 事件仍是一个原生 JSON 对象，
+文本位置仍为 `candidates[0].content.parts[].text`：
+
+```text
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Reactor"}]}}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":" 是一种事件驱动模型。"}]},"finishReason":"STOP"}]}
+```
+
+Gemini 原生流不依赖 OpenAI 的 `[DONE]` 标记。当前实现要求出现可接受的 `finishReason`，
+并且 HTTP 传输正常完成，才通知调用方结束。
+
+依据：[Gemini API](https://ai.google.dev/api/generate-content)、[文本生成及请求头示例](https://ai.google.dev/gemini-api/docs/text-generation)。
+
+### 8.4 Ollama 原生协议
+
+对应 `OllamaProvider` 和 `ApiProtocol::Ollama`，当前封装调用 `/api/chat`。
+
+**请求地址及请求头**
+
+```text
+POST http://127.0.0.1:11434/api/chat
+```
+
+| 请求头            | 值                          | 说明                                    |
+| ----------------- | --------------------------- | --------------------------------------- |
+| `Content-Type`  | `application/json`        | 请求体为 JSON                           |
+| `Accept`        | `application/json`        | 当前封装发送此值；流式响应实际为 NDJSON |
+| `Authorization` | 可选的 `Bearer <API_KEY>` | 本地无认证服务不发送；配置了密钥才发送  |
+
+**请求体参数**
+
+| 参数                                        | 是否必填          | 当前封装的含义                                                  |
+| ------------------------------------------- | ----------------- | --------------------------------------------------------------- |
+| `model`                                   | 是                | 已安装的完整模型名，包含实际版本或量化标签                      |
+| `messages`                                | 是                | 当前封装支持 System、User、Assistant 文本历史                   |
+| `messages[].role`、`messages[].content` | 是                | 消息角色与文本                                                  |
+| `stream`                                  | Provider 总是发送 | 普通为 `false`，流式为 `true`；原生 API 的默认值是 `true` |
+| `options.temperature`                     | 否                | 采样温度，放在 `options` 中                                   |
+| `options.num_predict`                     | 否                | 由 `maxOutputTokens` 映射出的输出上限                         |
+
+```json
+{
+  "model": "your-local-model:tag",
+  "messages": [{"role": "user", "content": "解释 Reactor 模型。"}],
+  "stream": false,
+  "options": {"temperature": 0.7, "num_predict": 512}
+}
+```
+
+**普通响应**
+
+```json
+{
+  "model": "your-local-model:tag",
+  "message": {"role": "assistant", "content": "Reactor 是一种事件驱动模型。"},
+  "done": true,
+  "done_reason": "stop",
+  "prompt_eval_count": 20,
+  "eval_count": 15,
+  "total_duration": 1000000000
+}
+```
+
+| 响应参数                              | 含义                       | 当前 SDK 的处理                             |
+| ------------------------------------- | -------------------------- | ------------------------------------------- |
+| `message.content`                   | 可见回复文本               | 作为返回字符串                              |
+| `message.thinking`                  | 模型的思考内容，可能缺省   | 不混入可见回复                              |
+| `done`                              | 本次生成是否完成           | 普通响应必须为 `true`；流式也用它判断结束 |
+| `done_reason`                       | 如自然结束或达到长度限制   | 当前返回接口不单独暴露                      |
+| `prompt_eval_count`、`eval_count` | 输入及输出 Token 数量      | 当前返回接口不单独暴露                      |
+| `total_duration` 等耗时字段         | 原生响应的计时，单位为纳秒 | 当前返回接口不单独暴露                      |
+
+**流式响应：NDJSON**
+
+仍调用 `/api/chat`，将 `stream` 设为 `true`，每行是一个独立 JSON 对象：
+
+```json
+{"message":{"role":"assistant","content":"Reactor"},"done":false}
+{"message":{"role":"assistant","content":" 是一种事件驱动模型。"},"done":false}
+{"message":{"role":"assistant","content":""},"done":true}
+```
+
+NDJSON 没有 SSE 的 `data:` 前缀，也没有 `[DONE]`。最后一条记录可以同时含有新增文本、
+结束状态和统计信息，应先处理文本，再处理结束状态。
+
+依据：[Ollama Chat](https://docs.ollama.com/api/chat)、[Ollama 流式协议](https://docs.ollama.com/api/streaming)。
