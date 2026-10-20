@@ -60,6 +60,7 @@ namespace modelBridge
         std::string content;    ///< UTF-8 文本内容。
         std::int64_t createdAt; ///< 创建时间，Unix 毫秒。
         std::string toolCallId; ///< Tool 消息关联的工具调用 ID，其他角色留空。
+        std::string toolName;   ///< ollama工具调用字段
     };
 
     /// 模型的基本信息，不包含连接密钥。
@@ -79,15 +80,17 @@ namespace modelBridge
      */
     struct ModelConfig
     {
-        std::string configId;               ///< 用户范围内唯一的连接 ID，用于区分同名模型的不同连接。
-        ModelInfo model;                    ///< 模型名称及协议。
-        std::string baseUrl;                ///< 服务根地址，可包含版本前缀；具体聊天路径由 Provider 拼接。
-        std::string apiKeyEnv;              ///< 密钥环境变量名，apiKey 为空时由 Provider 读取。
-        std::optional<double> temperature;  ///< 采样温度；未设置时使用服务端默认值。
-        std::optional<int> maxOutputTokens; ///< 输出 Token 上限，设置时须大于零。
-        int timeoutSeconds;                 ///< 请求超时秒数，须大于零。
-        bool stream;                        ///< 是否默认使用流式回复。
-        std::string apiKey;                 ///< 运行时直接传入的密钥
+        std::string configId;                       ///< 用户范围内唯一的连接 ID，用于区分同名模型的不同连接。
+        ModelInfo model;                            ///< 模型名称及协议。
+        std::string baseUrl;                        ///< 服务根地址，可包含版本前缀；具体聊天路径由 Provider 拼接。
+        std::string apiKeyEnv;                      ///< 密钥环境变量名，apiKey 为空时由 Provider 读取。
+        std::optional<double> temperature;          ///< 采样温度；未设置时使用服务端默认值。
+        std::optional<int> maxOutputTokens;         ///< 输出 Token 上限，设置时须大于零。
+        std::optional<std::string> reasoningEffort; ///< 推理级别，如 low/medium/high；可用值由平台和模型决定。
+        std::optional<bool> thinkingEnabled;        ///< 思考开关；用于 DeepSeek、百炼和 Ollama，未设置时沿用服务端默认值。
+        int timeoutSeconds;                         ///< 请求超时秒数，须大于零。
+        bool stream;                                ///< 是否默认使用流式回复。
+        std::string apiKey;                         ///< 运行时直接传入的密钥
     };
 
     /// 一个聊天会话及其完整历史。

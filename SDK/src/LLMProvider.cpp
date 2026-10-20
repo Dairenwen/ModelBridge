@@ -1,196 +1,15 @@
 #include "LLMProvider.hpp"
-#include <curl/curl.h>
+#include "Util.hpp"
+#include <httplib.h>
 #include <json/json.h>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <exception>
-#include <sstream>
 #include <stdexcept>
-#include <utility>
-
-namespace
-{
-    // curl 全局状态先于请求创建，退出时统一释放，不在每次请求间反复初始化。
-    struct CurlRuntime
-    {
-        CurlRuntime()
-        {
-            if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
-                throw std::runtime_error("Unable to initialize libcurl");
-        }
-        ~CurlRuntime() { curl_global_cleanup(); }
-    };
-
-    /// 解析单个 JSON 文档，严格拒绝尾部垃圾，错误中不回显密钥或响应正文。
-    Json::Value parseJson(const std::string &text)
-    {
-        Json::CharReaderBuilder builder;
-        builder["failIfExtra"] = true;
-        builder["allowComments"] = false;
-        std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
-        Json::Value value;
-        std::string errors;
-        if (!reader->parse(text.data(), text.data() + text.size(), &value, &errors) || !value.isObject())
-            throw std::runtime_error("Invalid JSON object in model response");
-        if (value.isMember("error"))
-            throw std::runtime_error("Model service returned an error");
-        return value;
-    }
-
-    /// 公共消息角色映射；不把非法枚举静默视为用户消息。
-    std::string roleName(modelBridge::MessageRole role)
-    {
-        using modelBridge::MessageRole;
-        switch (role)
-        {
-        case MessageRole::System:
-            return "system";
-        case MessageRole::User:
-            return "user";
-        case MessageRole::Assistant:
-            return "assistant";
-        case MessageRole::Tool:
-            return "tool";
-        }
-        throw std::invalid_argument("Unknown message role");
-    }
-
-    /// JSON 中的文本字段必须为字符串；缺省和 null 可表示无文本的增量。
-    std::string optionalText(const Json::Value &value)
-    {
-        if (value.isNull())
-            return {};
-        if (!value.isString())
-            throw std::runtime_error("Expected a text field in model response");
-        return value.asString();
-    }
-
-    /// 请求状态只在一次调用内使用；C 回调捕获异常，避免异常跨越 C ABI。
-    struct TransferState
-    {
-        long status = 0;                                  ///< 最近一组 HTTP 响应头的状态码。
-        std::string body;                                 ///< 普通响应或 HTTP 错误响应。
-        std::function<void(const std::string &)> receive; ///< 流式数据处理器。
-        std::exception_ptr exception;                     ///< 回调内抛出的解析或用户回调异常。
-    };
-
-    size_t receiveHeader(char *data, size_t size, size_t count, void *userData)
-    {
-        auto &state = *static_cast<TransferState *>(userData);
-        const auto length = size * count;
-        try
-        {
-            const std::string line(data, length);
-            if (line.compare(0, 5, "HTTP/") == 0)
-            {
-                const auto space = line.find(' ');
-                if (space == std::string::npos)
-                    throw std::runtime_error("Invalid HTTP status line");
-                state.status = std::stol(line.substr(space + 1));
-            }
-            return length;
-        }
-        catch (...)
-        {
-            state.exception = std::current_exception();
-            return 0;
-        }
-    }
-
-    size_t receiveBody(char *data, size_t size, size_t count, void *userData)
-    {
-        auto &state = *static_cast<TransferState *>(userData);
-        const auto length = size * count;
-        try
-        {
-            if (state.receive && state.status >= 200 && state.status < 300)
-                state.receive(std::string(data, length));
-            else
-                state.body.append(data, length);
-            return length;
-        }
-        catch (...)
-        {
-            state.exception = std::current_exception();
-            return 0;
-        }
-    }
-
-    /**
-     * 按协议解帧，而不是把 HTTP 数据块当成完整 JSON。
-     * SSE 以空行结束事件，可有多行 data；NDJSON 每行独立，允许最后一行无换行。
-     */
-    class StreamDecoder
-    {
-    public:
-        StreamDecoder(bool ndjson, std::function<void(const std::string &)> consume)
-            : ndjson(ndjson), consume(std::move(consume)) {}
-
-        void feed(const std::string &chunk)
-        {
-            buffer += chunk;
-            std::size_t end;
-            while ((end = buffer.find('\n')) != std::string::npos)
-            {
-                auto line = buffer.substr(0, end);
-                buffer.erase(0, end + 1);
-                if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
-                processLine(line);
-            }
-        }
-
-        void finish()
-        {
-            if (!buffer.empty())
-            {
-                if (buffer.back() == '\r')
-                    buffer.pop_back();
-                processLine(buffer);
-                buffer.clear();
-            }
-            dispatchEvent();
-        }
-
-    private:
-        bool ndjson;                                      ///< true 为 Ollama，false 为 SSE。
-        std::function<void(const std::string &)> consume; ///< 接收完整帧。
-        std::string buffer;                               ///< 尚未接收完整的一行。
-        std::string eventData;                            ///< SSE 事件中拼接的 data 字段。
-
-        void dispatchEvent()
-        {
-            if (eventData.empty())
-                return;
-            eventData.pop_back(); // 去掉按 SSE 规则追加的最后一个换行。
-            if (!eventData.empty())
-                consume(eventData);
-            eventData.clear();
-        }
-
-        void processLine(const std::string &line)
-        {
-            if (ndjson)
-            {
-                if (!line.empty())
-                    consume(line);
-            }
-            else if (line.empty())
-                dispatchEvent();
-            else if (line == "data" || line.compare(0, 5, "data:") == 0)
-            {
-                auto value = line == "data" ? std::string{} : line.substr(5);
-                if (!value.empty() && value.front() == ' ')
-                    value.erase(0, 1);
-                eventData += value + '\n';
-            }
-            // SSE 注释、event、id、retry 均不属于模型 JSON 内容。
-        }
-    };
-}
 
 namespace modelBridge
 {
+    // 基类：初始化、认证和公共 HTTP 流程
     bool LLMProvider::initialize(const ModelConfig &modelConfig)
     {
         configurationValid = false;
@@ -198,11 +17,8 @@ namespace modelBridge
         try
         {
             config = modelConfig;
-            if (config.model.protocol != getProtocol())
-                throw std::invalid_argument("Provider protocol does not match model configuration");
-            if (config.model.modelName.empty())
-                throw std::invalid_argument("Model name is required");
-            // baseUrl 必须是服务根地址；不接受带密钥的 URL、查询串或片段。
+            if (config.model.protocol != getProtocol() || config.model.modelName.empty())
+                throw std::invalid_argument("Matching protocol and model name are required");
             const auto scheme = config.baseUrl.find("://");
             if (scheme == std::string::npos ||
                 (config.baseUrl.substr(0, scheme) != "http" && config.baseUrl.substr(0, scheme) != "https") ||
@@ -210,35 +26,42 @@ namespace modelBridge
                 throw std::invalid_argument("baseUrl must be an HTTP(S) service root without credentials or query");
             while (!config.baseUrl.empty() && config.baseUrl.back() == '/')
                 config.baseUrl.pop_back();
-            if (config.baseUrl.size() <= scheme + 3)
-                throw std::invalid_argument("baseUrl host is required");
             if (config.timeoutSeconds <= 0 || (config.maxOutputTokens && *config.maxOutputTokens <= 0))
                 throw std::invalid_argument("Timeout and output token limit must be positive");
             if (config.temperature && (!std::isfinite(*config.temperature) || *config.temperature < 0))
                 throw std::invalid_argument("Temperature must be finite and non-negative");
-            static CurlRuntime runtime;
+
+            validateReasoning(config);
+
             if (config.apiKey.empty() && !config.apiKeyEnv.empty())
             {
-                if (const auto *value = std::getenv(config.apiKeyEnv.c_str()))
-                    config.apiKey = value;
+                if (const auto *key = std::getenv(config.apiKeyEnv.c_str()))
+                    config.apiKey = key;
             }
+
+            if (getProtocol() == ApiProtocol::Ollama || !config.apiKey.empty())
+                throw std::invalid_argument("API key is required for this protocol");
+
             if (config.apiKey.find_first_of("\r\n") != std::string::npos)
                 throw std::invalid_argument("API key contains a newline");
+
             configurationValid = true;
-            if (!isInitialized())
-                throw std::invalid_argument("API key is required for this protocol");
+
+            MB_LOG_INFO("模型初始化成功：model={}", config.model.modelName);
             return true;
         }
         catch (const std::exception &error)
         {
+            configurationValid = false;
             lastError = error.what();
+            MB_LOG_ERROR("模型初始化失败：{}", lastError);
             return false;
         }
     }
 
     bool LLMProvider::isInitialized() const
     {
-        return configurationValid && (getProtocol() == ApiProtocol::Ollama || !config.apiKey.empty());
+        return configurationValid;
     }
 
     const std::string &LLMProvider::getModelName() const { return config.model.modelName; }
@@ -252,8 +75,7 @@ namespace modelBridge
         if (apiKey.find_first_of("\r\n") != std::string::npos)
             throw std::invalid_argument("API key contains a newline");
         config.apiKey = apiKey;
-        if (isInitialized())
-            lastError.clear();
+        MB_LOG_DEBUG("模型认证信息已更新");
     }
 
     std::string LLMProvider::sendMessage(const std::vector<Message> &messages)
@@ -261,176 +83,227 @@ namespace modelBridge
         return performRequest(messages, false, {});
     }
 
-    std::string LLMProvider::sendMessageStream(const std::vector<Message> &messages,
-                                               const StreamCallback &callback)
+    std::string LLMProvider::sendMessageStream(const std::vector<Message> &messages, const StreamCallback &callback)
     {
         if (!callback)
             throw std::invalid_argument("Stream callback is required");
         return performRequest(messages, true, callback);
     }
 
-    std::string LLMProvider::performRequest(const std::vector<Message> &messages, bool stream,
-                                            const StreamCallback &callback)
+    std::string LLMProvider::performRequest(const std::vector<Message> &messages, bool stream, const StreamCallback &callback)
     {
-        if (!isInitialized())
-            throw std::logic_error("Provider is not initialized");
-        if (messages.empty())
-            throw std::invalid_argument("Messages must not be empty");
-        Json::StreamWriterBuilder writer;
-        writer["indentation"] = "";
-        const auto body = Json::writeString(writer, makeRequestBody(messages, stream));
-        const auto url = config.baseUrl + makeRequestPath(stream);
-        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> client(curl_easy_init(), curl_easy_cleanup);
-        if (!client)
-            throw std::runtime_error("Unable to create HTTP client");
-
-        std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(nullptr, curl_slist_free_all);
-        const auto addHeader = [&](const std::string &header)
+        const auto started = std::chrono::steady_clock::now();
+        const char *stage = "检查配置";
+        std::string errorBody;
+        long status = 0;
+        httplib::Error transportError = httplib::Error::Success;
+        try
         {
-            auto *list = curl_slist_append(headers.get(), header.c_str());
-            if (!list)
-                throw std::bad_alloc();
-            headers.release();
-            headers.reset(list);
-        };
-        addHeader("Content-Type: application/json");
-        addHeader(stream && getProtocol() != ApiProtocol::Ollama ? "Accept: text/event-stream" : "Accept: application/json");
-        if (!config.apiKey.empty())
-            addHeader(getProtocol() == ApiProtocol::Gemini ? "x-goog-api-key: " + config.apiKey : "Authorization: Bearer " + config.apiKey);
+            if (!isInitialized())
+                throw std::logic_error("Provider is not initialized");
+            if (messages.empty())
+                throw std::invalid_argument("Messages must not be empty");
+            MB_LOG_INFO("开始模型请求：model={}，stream={}，消息数={}", config.model.modelName, stream, messages.size());
 
-        bool finished = false;
-        std::string result;
-        StreamDecoder decoder(getProtocol() == ApiProtocol::Ollama, [&](const std::string &frame)
-                              {
-            if (frame == "[DONE]" && getProtocol() == ApiProtocol::OpenAICompatible)
+            // 1. httplib 的 Client 只接收协议和主机，版本前缀留在请求路径中。
+            stage = "构造请求";
+            const auto protocol = getProtocol();
+            const auto pathStart = config.baseUrl.find('/', config.baseUrl.find("://") + 3);
+            const auto origin = config.baseUrl.substr(0, pathStart);
+            const auto prefix = pathStart == std::string::npos ? "" : config.baseUrl.substr(pathStart);
+            httplib::Client client(origin);
+            client.set_connection_timeout(config.timeoutSeconds);
+            client.set_read_timeout(config.timeoutSeconds);
+            client.set_write_timeout(config.timeoutSeconds);
+            client.set_max_timeout(std::chrono::seconds(config.timeoutSeconds));
+
+            httplib::Request request;
+            request.method = "POST";
+            request.path = prefix + makeRequestPath(stream);
+            request.headers.emplace("Content-Type", "application/json");
+            request.headers.emplace("Accept", stream && protocol != ApiProtocol::Ollama ? "text/event-stream" : "application/json");
+            if (!config.apiKey.empty())
             {
-                finished = true;
-                return;
+                const auto header = protocol == ApiProtocol::Gemini ? "x-goog-api-key" : "Authorization";
+                request.headers.emplace(header, protocol == ApiProtocol::Gemini ? config.apiKey : "Bearer " + config.apiKey);
             }
-            const auto wasFinished = finished;
-            const auto delta = readResponse(parseJson(frame), true, finished);
-            if (wasFinished && !delta.empty()) throw std::runtime_error("Text received after stream completion");
-            result += delta;
-            if (!delta.empty()) callback(delta, false); });
-        TransferState state;
-        if (stream)
-            state.receive = [&](const std::string &chunk)
-            { decoder.feed(chunk); };
+            Json::StreamWriterBuilder writer;
+            writer["indentation"] = ""; // 不对 JSON 进行格式化缩进，减少不必要的请求体字节
+            request.body = Json::writeString(writer, makeRequestBody(messages, stream));
+            MB_LOG_DEBUG("模型请求体已构造：字节数={}", request.body.size());
 
-        // 设置总超时和连接超时，开启 HTTPS 证书验证，不跟随重定向泄露认证头。
-        const auto setOption = [&](CURLoption option, auto value)
+            // 2. 流式事件提取可见文本；完成通知统一在整个 HTTP 请求成功后发出。
+            bool finished = false;
+            bool receivedDone = false;
+            std::string result;
+            StreamDecoder decoder;
+            decoder.ndjson = protocol == ApiProtocol::Ollama;
+            if (stream)
+            {
+                decoder.onEvent = [&](const std::string &event)
+                {
+                    if (protocol == ApiProtocol::OpenAICompatible && event == "[DONE]")
+                    {
+                        if (receivedDone)
+                            throw std::runtime_error("Duplicate stream completion marker");
+
+                        receivedDone = true;
+                        return;
+                    }
+
+                    if (receivedDone)
+                        throw std::runtime_error("Data received after stream completion");
+
+                    const auto delta = readResponse(parseJson(event), true, finished);
+                    result += delta;
+
+                    if (!delta.empty())
+                        callback(delta, false);
+                };
+            }
+
+            request.response_handler = [&](const httplib::Response &response)
+            {
+                status = response.status;
+                return true;
+            };
+
+            if (stream)
+            {
+                request.content_receiver = [&](const char *data, size_t length, size_t, size_t)
+                {
+                    if (status >= 200 && status < 300)
+                        decoder.append(data, length);
+                    else
+                        errorBody.append(data, length);
+
+                    return true;
+                };
+            }
+            stage = "传输或流式处理";
+            const auto response = client.send(request);
+            transportError = response.error();
+            if (!response)
+                throw std::runtime_error("HTTP request failed: " + httplib::to_string(transportError));
+            status = response->status;
+            if (status < 200 || status >= 300)
+            {
+                const auto &body = stream ? errorBody : response->body;
+                throw std::runtime_error("Model HTTP status " + std::to_string(status) + ": " + body);
+            }
+
+            // 3. 解析剩余数据。补入换行，用同一分帧逻辑处理末尾没有换行的数据。
+            stage = "解析回复或完成回调";
+            if (stream)
+            {
+                decoder.finish();
+                if (!finished || (protocol == ApiProtocol::OpenAICompatible && !receivedDone))
+                {
+                    throw std::runtime_error("Model stream ended without complete termination information");
+                }
+                callback("", true);
+            }
+            else
+                result = readResponse(parseJson(response->body), false, finished);
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+            MB_LOG_INFO("模型请求完成：model={}，HTTP={}，回复字节数={}，耗时={}ms", config.model.modelName, status, result.size(), elapsed);
+            return result;
+        }
+        catch (...)
         {
-            if (curl_easy_setopt(client.get(), option, value) != CURLE_OK)
-                throw std::runtime_error("Unable to configure HTTP client");
-        };
-        setOption(CURLOPT_URL, url.c_str());
-        setOption(CURLOPT_POST, 1L);
-        setOption(CURLOPT_POSTFIELDS, body.c_str());
-        setOption(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
-        setOption(CURLOPT_HTTPHEADER, headers.get());
-        setOption(CURLOPT_TIMEOUT, static_cast<long>(config.timeoutSeconds));
-        setOption(CURLOPT_CONNECTTIMEOUT, static_cast<long>(config.timeoutSeconds));
-        setOption(CURLOPT_NOSIGNAL, 1L);
-        setOption(CURLOPT_SSL_VERIFYPEER, 1L);
-        setOption(CURLOPT_SSL_VERIFYHOST, 2L);
-        setOption(CURLOPT_FOLLOWLOCATION, 0L);
-        setOption(CURLOPT_HEADERFUNCTION, &receiveHeader);
-        setOption(CURLOPT_HEADERDATA, &state);
-        setOption(CURLOPT_WRITEFUNCTION, &receiveBody);
-        setOption(CURLOPT_WRITEDATA, &state);
-        const auto code = curl_easy_perform(client.get());
-        if (state.exception)
-            std::rethrow_exception(state.exception);
-        if (code != CURLE_OK)
-            throw std::runtime_error(std::string("HTTP transport failed: ") + curl_easy_strerror(code));
-        if (state.status < 200 || state.status >= 300)
-            throw std::runtime_error("Model HTTP status " + std::to_string(state.status));
-
-        if (!stream)
-            return readResponse(parseJson(state.body), false, finished);
-        decoder.finish();
-        if (!finished)
-            throw std::runtime_error("Model stream ended without a completion marker");
-        callback("", true); // 只有 HTTP 及协议均成功才通知完成，且恰好一次。
-        return result;
+            // 回调可能抛出含业务数据的异常，日志只记录阶段，异常原样交给调用方。
+            MB_LOG_ERROR("模型请求失败：model={}，阶段={}，HTTP={}，传输状态={}", config.model.modelName, stage, status, httplib::to_string(transportError));
+            throw;
+        }
     }
 
+    // OpenAI 兼容协议：OpenAI、DeepSeek、百炼
     ApiProtocol OpenAICompatibleProvider::getProtocol() const { return ApiProtocol::OpenAICompatible; }
+
+    /// 普通与流式调用共用 /chat/completions
     std::string OpenAICompatibleProvider::makeRequestPath(bool) const { return "/chat/completions"; }
 
+    /// 生成 messages 和顶层参数，思考开关按平台转换。
     Json::Value OpenAICompatibleProvider::makeRequestBody(const std::vector<Message> &messages, bool stream) const
     {
-        Json::Value body(Json::objectValue);
+        Json::Value body;
         body["model"] = config.model.modelName;
+        body["messages"] = makeChatMessages(messages, getProtocol());
         body["stream"] = stream;
-        body["messages"] = Json::Value(Json::arrayValue);
-        for (const auto &message : messages)
-        {
-            Json::Value item(Json::objectValue);
-            item["role"] = roleName(message.role);
-            item["content"] = message.content;
-            if (message.role == MessageRole::Tool)
-            {
-                if (message.toolCallId.empty())
-                    throw std::invalid_argument("Tool result requires toolCallId");
-                item["tool_call_id"] = message.toolCallId;
-            }
-            body["messages"].append(item);
-        }
         if (config.temperature)
             body["temperature"] = *config.temperature;
         if (config.maxOutputTokens)
-        {
-            // OpenAI 的当前参数与兼容服务的传统参数不同，按服务平台选择。
             body[config.model.provider == ProviderType::OpenAI ? "max_completion_tokens" : "max_tokens"] = *config.maxOutputTokens;
+        if (config.reasoningEffort)
+            body["reasoning_effort"] = *config.reasoningEffort;
+        if (config.thinkingEnabled.has_value())
+        {
+            if (config.model.provider == ProviderType::DeepSeek)
+                body["thinking"]["type"] = *config.thinkingEnabled ? "enabled" : "disabled";
+            else
+                body["enable_thinking"] = *config.thinkingEnabled; // 初始化已限定为百炼
         }
         return body;
     }
 
+    /// 普通回复取 message.content，流式取 delta.content；忽略思考过程和用量事件。
     std::string OpenAICompatibleProvider::readResponse(const Json::Value &payload, bool stream, bool &finished) const
     {
         const auto &choices = payload["choices"];
         if (!choices.isArray() || (!stream && choices.empty()))
             throw std::runtime_error("Missing chat choices");
         if (choices.empty())
-            return {}; // 流末尾可能有不含候选的用量统计事件。
-        const auto &choice = choices[0];
-        const auto reason = choice.get("finish_reason", "").asString();
-        if (reason == "tool_calls" || reason == "function_call" || reason == "content_filter")
-            throw std::runtime_error("Response requires tools or was blocked; text-only interface cannot return it");
-        const auto &message = choice[stream ? "delta" : "message"];
+            return {}; // 流末尾可能只有用量统计。
+        const auto &message = choices[0][stream ? "delta" : "message"];
+        const auto reason = choices[0].get("finish_reason", "").asString();
         if (!message.isObject())
             throw std::runtime_error("Missing assistant message");
-        if (!message["tool_calls"].empty() || !message["function_call"].isNull())
-            throw std::runtime_error("Tool calls are not supported by the text-only response interface");
-        if (!stream)
+        if (reason == "content_filter" || reason == "tool_calls" || reason == "function_call" ||
+            !message["tool_calls"].empty() || !message["function_call"].isNull())
+            throw std::runtime_error("Response was blocked or requires tools unsupported by the text interface");
+        if (reason == "length")
+            MB_LOG_WARN("模型回复达到输出上限：model={}", config.model.modelName);
+
+        if (!reason.empty())
+        {
+            // 工具调用和内容过滤已经在上方单独处理。
+            if (reason != "stop" && reason != "length")
+                throw std::runtime_error("Unsupported finish_reason: " + reason);
+
             finished = true;
-        return optionalText(message["content"]);
+        }
+        else if (!stream)
+        {
+            throw std::runtime_error("Non-streaming response is missing finish_reason");
+        }
+
+        return readText(message["content"]) + readText(message["refusal"]);
     }
 
+    // 2. Gemini 原生协议
     ApiProtocol GeminiProvider::getProtocol() const { return ApiProtocol::Gemini; }
 
+    /// 模型名放入 URL；流式使用 streamGenerateContent 和 SSE。
     std::string GeminiProvider::makeRequestPath(bool stream) const
     {
-        auto name = config.model.modelName;
-        if (name.compare(0, 7, "models/") == 0)
-            name.erase(0, 7);
-        if (name.empty())
+        auto model = config.model.modelName;
+        if (model.compare(0, 7, "models/") == 0)
+            model.erase(0, 7);
+        if (model.empty())
             throw std::invalid_argument("Gemini model name is required");
-        // 对模型路径段编码，避免模型名中的斜杠或问号改变 API 路径。
-        std::unique_ptr<char, decltype(&curl_free)> encoded(curl_easy_escape(nullptr, name.c_str(), 0), curl_free);
-        if (!encoded)
-            throw std::runtime_error("Unable to encode model name");
-        return "/models/" + std::string(encoded.get()) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent");
+        return "/models/" + httplib::encode_uri_component(model) +
+               (stream ? ":streamGenerateContent?alt=sse" : ":generateContent");
     }
 
+    /// System 放入 systemInstruction，Assistant 转为 model，其余文本放入 parts。
     Json::Value GeminiProvider::makeRequestBody(const std::vector<Message> &messages, bool) const
     {
-        Json::Value body(Json::objectValue);
-        body["contents"] = Json::Value(Json::arrayValue);
+        Json::Value body;
+        auto &contents = body["contents"];
+        contents = Json::Value(Json::arrayValue);
         for (const auto &message : messages)
         {
-            Json::Value part(Json::objectValue);
+            Json::Value part;
             part["text"] = message.content;
             if (message.role == MessageRole::System)
             {
@@ -439,26 +312,36 @@ namespace modelBridge
             }
             if (message.role != MessageRole::User && message.role != MessageRole::Assistant)
                 throw std::invalid_argument("Gemini text interface supports System, User and Assistant messages");
-            Json::Value item(Json::objectValue);
-            item["role"] = message.role == MessageRole::Assistant ? "model" : "user";
-            item["parts"].append(part);
-            // 合并连续同角色消息，保持 Gemini 多轮内容的角色交替。
-            auto &contents = body["contents"];
-            if (!contents.empty() && contents[contents.size() - 1]["role"] == item["role"])
-                contents[contents.size() - 1]["parts"].append(part);
+            const auto role = message.role == MessageRole::Assistant ? "model" : "user";
+            if (!contents.empty() && contents[contents.size() - 1]["role"] == role)
+                contents[contents.size() - 1]["parts"].append(part); // 合并连续同角色消息。
             else
+            {
+                Json::Value item;
+                item["role"] = role;
+                item["parts"].append(part);
                 contents.append(item);
+            }
         }
-        if (body["contents"].empty())
+        if (contents.empty())
             throw std::invalid_argument("Gemini requires a non-system message");
         if (config.temperature)
             body["generationConfig"]["temperature"] = *config.temperature;
         if (config.maxOutputTokens)
             body["generationConfig"]["maxOutputTokens"] = *config.maxOutputTokens;
+        if (config.reasoningEffort)
+        {
+            auto level = *config.reasoningEffort;
+            for (auto &letter : level)
+                if (letter >= 'a' && letter <= 'z')
+                    letter = static_cast<char>(letter - 'a' + 'A');
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"] = level;
+        }
         return body;
     }
 
-    std::string GeminiProvider::readResponse(const Json::Value &payload, bool, bool &finished) const
+    /// 按顺序拼接首个候选的可见 parts，以 finishReason 判断流结束。
+    std::string GeminiProvider::readResponse(const Json::Value &payload, bool stream, bool &finished) const
     {
         if (payload["promptFeedback"].isMember("blockReason"))
             throw std::runtime_error("Gemini blocked the prompt");
@@ -469,6 +352,8 @@ namespace modelBridge
         const auto reason = candidate.get("finishReason", "").asString();
         if (!reason.empty() && reason != "STOP" && reason != "MAX_TOKENS")
             throw std::runtime_error("Gemini generation was blocked or failed");
+        if (reason == "MAX_TOKENS")
+            MB_LOG_WARN("Gemini 回复达到输出上限：model={}", config.model.modelName);
         if (!reason.empty())
             finished = true;
         const auto &parts = candidate["content"]["parts"];
@@ -480,50 +365,52 @@ namespace modelBridge
             if (part.isMember("functionCall"))
                 throw std::runtime_error("Gemini function calls require a tool interface");
             if (!part.get("thought", false).asBool())
-                text += optionalText(part["text"]);
+                text += readText(part["text"]);
         }
         return text;
     }
 
+    // 3. Ollama 原生协议
     ApiProtocol OllamaProvider::getProtocol() const { return ApiProtocol::Ollama; }
+
+    /// 兼容 baseUrl 已带 /api 的写法，避免重复拼接。
     std::string OllamaProvider::makeRequestPath(bool) const
     {
-        return config.baseUrl.size() >= 4 && config.baseUrl.compare(config.baseUrl.size() - 4, 4, "/api") == 0 ? "/chat" : "/api/chat";
+        const bool hasApi = config.baseUrl.size() >= 4 && config.baseUrl.compare(config.baseUrl.size() - 4, 4, "/api") == 0;
+        return hasApi ? "/chat" : "/api/chat";
     }
 
+    /// 采样参数放入 options；think 在顶层，支持字符串级别或布尔开关。
     Json::Value OllamaProvider::makeRequestBody(const std::vector<Message> &messages, bool stream) const
     {
-        Json::Value body(Json::objectValue);
+        Json::Value body;
         body["model"] = config.model.modelName;
+        body["messages"] = makeChatMessages(messages, getProtocol());
         body["stream"] = stream;
-        body["messages"] = Json::Value(Json::arrayValue);
-        for (const auto &message : messages)
-        {
-            if (message.role == MessageRole::Tool)
-                throw std::invalid_argument("Ollama tool results require tool definitions and names, not provided by the text interface");
-            Json::Value item(Json::objectValue);
-            item["role"] = roleName(message.role);
-            item["content"] = message.content;
-            body["messages"].append(item);
-        }
         if (config.temperature)
             body["options"]["temperature"] = *config.temperature;
         if (config.maxOutputTokens)
             body["options"]["num_predict"] = *config.maxOutputTokens;
+        if (config.reasoningEffort)
+            body["think"] = *config.reasoningEffort;
+        else if (config.thinkingEnabled.has_value())
+            body["think"] = *config.thinkingEnabled;
         return body;
     }
 
+    /// 普通 JSON 和每条 NDJSON 使用同一结构；最终记录可同时带文本和 done=true。
     std::string OllamaProvider::readResponse(const Json::Value &payload, bool stream, bool &finished) const
     {
-        if (!payload["done"].isBool())
-            throw std::runtime_error("Missing Ollama completion state");
+        const auto &message = payload["message"];
+        if (!payload["done"].isBool() || !message.isObject())
+            throw std::runtime_error("Invalid Ollama response");
         finished = payload["done"].asBool();
         if (!stream && !finished)
             throw std::runtime_error("Incomplete non-streaming Ollama response");
-        if (!payload["message"].isObject())
-            throw std::runtime_error("Missing Ollama message");
-        if (!payload["message"]["tool_calls"].empty())
+        if (!message["tool_calls"].empty())
             throw std::runtime_error("Ollama tool calls require a tool interface");
-        return optionalText(payload["message"]["content"]);
+        if (finished && payload.get("done_reason", "").asString() == "length")
+            MB_LOG_WARN("Ollama 回复达到输出上限：model={}", config.model.modelName);
+        return readText(message["content"]);
     }
-}
+} // namespace modelBridge

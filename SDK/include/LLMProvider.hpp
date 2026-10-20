@@ -34,7 +34,7 @@ namespace modelBridge
          */
         bool initialize(const ModelConfig &modelConfig);
 
-        /** @brief 检查本地配置及密钥是否就绪。@return 就绪时返回 true。 */
+        /** @brief 查询最近一次初始化是否成功。 */
         bool isInitialized() const;
 
         /** @brief 获取模型名称。@return 配置中的模型 API 标识。 */
@@ -106,7 +106,7 @@ namespace modelBridge
 
     private:
         bool configurationValid = false; ///< 模型、地址及参数是否通过本地校验。
-        std::string lastError;           ///< 初始化错误，不包含密钥值或远端响应正文。
+        std::string lastError;           ///< 初始化错误
 
         /**
          * @brief 执行公共 HTTP 流程

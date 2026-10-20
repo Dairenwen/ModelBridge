@@ -324,7 +324,6 @@ apt install -y \
     libspdlog-dev \
     libfmt-dev \
     libjsoncpp-dev \
-    libcurl4-openssl-dev \
     libgtest-dev \
     libssl-dev \
     libsqlite3-dev
@@ -366,6 +365,7 @@ cp httplib.h /usr/local/include/
 ```
 
 也可以将固定版本的 `httplib.h` 放入项目的第三方依赖目录，避免依赖系统全局安装。
+
 
 ## 7. 使用 Postman 调试本地 Ollama
 
@@ -1087,6 +1087,41 @@ DeepSeek 是 `https://api.deepseek.com/chat/completions`。
 
 依据：[OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat)、[DeepSeek 接入说明](https://api-docs.deepseek.com/)、[百炼 OpenAI 兼容接口](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)。
 
+**推理深度配置**
+
+在 `ModelConfig` 的生成参数处保留两个可选字段；未设置时不发送对应参数，使用服务端默认值：
+
+| 配置字段            | 类型                           | 含义                                             |
+| ------------------- | ------------------------------ | ------------------------------------------------ |
+| `reasoningEffort` | `std::optional<std::string>` | 推理级别，按协议转换或原样传递；                 |
+| `thinkingEnabled` | `std::optional<bool>`        | 显式开启或关闭思考，用于 DeepSeek、百炼和 Ollama |
+
+| 协议 / 平台              | `reasoningEffort` 映射                                    | `thinkingEnabled` 映射                           |
+| ------------------------ | ----------------------------------------------------------- | -------------------------------------------------- |
+| OpenAI / Custom 兼容服务 | 顶层 `reasoning_effort`                                   | 不支持，改用模型支持的推理级别                     |
+| DeepSeek 兼容服务        | 顶层 `reasoning_effort`                                   | 顶层 `thinking.type`：`enabled` / `disabled` |
+| 百炼兼容服务             | 顶层 `reasoning_effort`，仅适用支持该参数的模型           | 顶层 `enable_thinking`                           |
+| Gemini 原生              | `generationConfig.thinkingConfig.thinkingLevel`，转为大写 | 不支持                                             |
+| Ollama 原生              | 顶层 `think` 字符串                                       | 顶层 `think` 布尔值                              |
+
+例如，配置一个支持 `high` 的 OpenAI 推理模型：
+
+```cpp
+modelBridge::ModelConfig config{};
+config.model.protocol = modelBridge::ApiProtocol::OpenAICompatible;
+config.model.provider = modelBridge::ProviderType::OpenAI;
+config.model.modelName = "your-reasoning-model-id"; // 替换为实际支持推理的模型。
+config.baseUrl = "https://api.openai.com/v1";
+config.apiKeyEnv = "OPENAI_API_KEY";
+config.timeoutSeconds = 120;
+config.reasoningEffort = "high";
+// temperature 保持未设置，部分推理模型不接受它。
+
+modelBridge::OpenAICompatibleProvider provider;
+if (!provider.initialize(config))
+    throw std::runtime_error(provider.getLastError());
+```
+
 ### 8.2 OpenAI 兼容协议
 
 对应 `OpenAICompatibleProvider` 和 `ApiProtocol::OpenAICompatible`。OpenAI、DeepSeek、百炼以及兼容此协议的中转服务可以共用该实现。
@@ -1102,17 +1137,20 @@ DeepSeek 是 `https://api.deepseek.com/chat/completions`。
 
 **请求体参数**
 
-| 参数                        | 是否必填          | 当前封装的含义                                                  |
-| --------------------------- | ----------------- | --------------------------------------------------------------- |
-| `model`                   | 是                | `ModelInfo::modelName`，请求使用的模型 ID                     |
-| `messages`                | 是                | 按顺序保存的完整上下文，不能为空                                |
-| `messages[].role`         | 是                | `system`、`user`、`assistant`；工具结果使用 `tool`      |
-| `messages[].content`      | 是                | 文本内容                                                        |
-| `messages[].tool_call_id` | Tool 消息需要     | 对应 `Message::toolCallId`，关联原工具调用                    |
-| `stream`                  | Provider 总是发送 | `sendMessage` 为 `false`，`sendMessageStream` 为 `true` |
-| `temperature`             | 否                | 配置了 `temperature` 才发送，包括显式的 `0`                 |
-| `max_completion_tokens`   | 否                | `provider == ProviderType::OpenAI` 时使用的输出上限字段       |
-| `max_tokens`              | 否                | 当前封装对其他兼容平台使用的输出上限字段                        |
+| 参数                        | 是否必填          | 当前封装的含义                                                         |
+| --------------------------- | ----------------- | ---------------------------------------------------------------------- |
+| `model`                   | 是                | `ModelInfo::modelName`，请求使用的模型 ID                            |
+| `messages`                | 是                | 按顺序保存的完整上下文，不能为空                                       |
+| `messages[].role`         | 是                | `system`、`user`、`assistant`；工具结果使用 `tool`             |
+| `messages[].content`      | 是                | 文本内容                                                               |
+| `messages[].tool_call_id` | Tool 消息需要     | 对应 `Message::toolCallId`，关联原工具调用                           |
+| `stream`                  | Provider 总是发送 | `sendMessage` 为 `false`，`sendMessageStream` 为 `true`        |
+| `temperature`             | 否                | 配置了 `temperature` 才发送，包括显式的 `0`                        |
+| `max_completion_tokens`   | 否                | `provider == ProviderType::OpenAI` 时使用的输出上限字段              |
+| `max_tokens`              | 否                | 当前封装对其他兼容平台使用的输出上限字段                               |
+| `reasoning_effort`        | 否                | `reasoningEffort`；可用级别以具体模型为准                            |
+| `thinking.type`           | 否                | DeepSeek 的 `thinkingEnabled` 映射，值为 `enabled` 或 `disabled` |
+| `enable_thinking`         | 否                | 百炼的 `thinkingEnabled` 映射，布尔值                                |
 
 两种 Token 上限字段只发送一种；部分模型不支持温度等采样参数，可保持未设置。
 以下为 DeepSeek 等传统兼容接口的示例请求体：
@@ -1170,6 +1208,18 @@ data: [DONE]
 
 可见文本位于 `choices[0].delta.content`，按增量拼接。角色事件或用量事件可以没有文本，不能因此判断响应结束。当前封装以 `[DONE]` 判断 OpenAI 兼容流已完整结束。
 
+**推理与历史会话注意事项**
+
+- OpenAI 的推理级别取决于模型，例如 `low`、`medium`、`high`；不能认为所有模型均支持 `none`、`minimal`、`xhigh` 或 `max`。
+- DeepSeek 当前接口支持 `reasoning_effort`（如 `none`、`low`、`high`、`max`）和 `thinking.type`。可只设置一个；同时设置时必须一致，例如 `thinkingEnabled = false` 不能与 `reasoningEffort = "high"` 同用。旧版模型或兼容实现可能只支持其中部分参数。
+- 百炼使用 `thinkingEnabled = true` 开启思考；部分模型另支持 `reasoning_effort`，不能把它当作所有百炼模型的通用参数。显式关闭思考时，本封装拒绝再设置非 `none` 的级别。部分思考模型只支持流式调用，应使用 `sendMessageStream`。
+- 本封装调用的 Chat Completions 需要客户端每次发送所需的完整 `messages`；**SDK 不会在 Provider 内保存历史，也不会自动追加回复。**
+- 保持系统设定时，每轮都要携带 `System` 消息；历史回复使用 `Assistant`，新问题使用 `User`，按发生顺序排列。**只发送新问题不会自动获得前文，服务端的缓存也不替代本封装的历史传递。**
+- 成功后，将返回的完整文本作为一条 `Assistant` 消息保存，再追加下一条 `User`；流式增量只用于展示，最终回复只保存一次。
+- 当前 `Message` 只保存文本及 `toolCallId`，不保存 `reasoning_content` 和完整工具调用信息。普通文本历史保存最终回答即可；需要回传思考内容的工具调用流程不在当前接口范围内。仅存在 `Tool` 角色不代表已经支持完整工具会话。
+
+依据：[OpenAI 推理参数](https://developers.openai.com/api/docs/guides/reasoning?api-mode=chat)、[DeepSeek 请求参数](https://api-docs.deepseek.com/api/create-chat-completion/)、[百炼深度思考](https://help.aliyun.com/zh/model-studio/deep-thinking)、[DeepSeek 多轮对话](https://api-docs.deepseek.com/guides/multi_round_chat/)、[OpenAI 会话状态](https://developers.openai.com/api/docs/guides/conversation-state)。
+
 ### 8.3 Gemini 原生协议
 
 对应 `GeminiProvider` 和 `ApiProtocol::Gemini`。
@@ -1191,14 +1241,15 @@ data: [DONE]
 
 **请求体参数**
 
-| 参数                                 | 是否必填     | 当前封装的含义                                   |
-| ------------------------------------ | ------------ | ------------------------------------------------ |
-| `contents`                         | 是           | 用户及模型的对话历史，至少包含一条非 System 消息 |
-| `contents[].role`                  | 当前封装发送 | User 映射为 `user`，Assistant 映射为 `model` |
-| `contents[].parts[].text`          | 文本请求需要 | 一条消息的文本内容                               |
-| `systemInstruction.parts[].text`   | 否           | System 消息放在这里，不放入 `contents`         |
-| `generationConfig.temperature`     | 否           | 采样温度                                         |
-| `generationConfig.maxOutputTokens` | 否           | 输出 Token 上限                                  |
+| 参数                                              | 是否必填     | 当前封装的含义                                              |
+| ------------------------------------------------- | ------------ | ----------------------------------------------------------- |
+| `contents`                                      | 是           | 用户及模型的对话历史，至少包含一条非 System 消息            |
+| `contents[].role`                               | 当前封装发送 | User 映射为 `user`，Assistant 映射为 `model`            |
+| `contents[].parts[].text`                       | 文本请求需要 | 一条消息的文本内容                                          |
+| `systemInstruction.parts[].text`                | 否           | System 消息放在这里，不放入 `contents`                    |
+| `generationConfig.temperature`                  | 否           | 采样温度                                                    |
+| `generationConfig.maxOutputTokens`              | 否           | 输出 Token 上限                                             |
+| `generationConfig.thinkingConfig.thinkingLevel` | 否           | `reasoningEffort` 转为大写后发送，如 `high` → `HIGH` |
 
 Gemini 的模型名位于 URL 中，原生请求体不添加 OpenAI 风格的 `model`、`messages` 或 `stream`。
 连续同角色消息在当前实现中合并为同一条内容的多个 parts。
@@ -1254,7 +1305,16 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":" 是一种事�
 Gemini 原生流不依赖 OpenAI 的 `[DONE]` 标记。当前实现要求出现可接受的 `finishReason`，
 并且 HTTP 传输正常完成，才通知调用方结束。
 
-依据：[Gemini API](https://ai.google.dev/api/generate-content)、[文本生成及请求头示例](https://ai.google.dev/gemini-api/docs/text-generation)。
+**推理与历史会话注意事项**
+
+- 支持级别控制的模型可设置 `reasoningEffort = "high"`，发送 `thinkingLevel: "HIGH"`；级别枚举包括 `MINIMAL`、`LOW`、`MEDIUM`、`HIGH`，具体可用项取决于模型。早期模型不支持 `thinkingLevel`。
+- 当前封装仅提供推理级别设置；不支持级别控制的旧模型应保持 `reasoningEffort` 未设置，沿用服务端默认行为。`thinkingEnabled` 在此协议下会被拒绝。SDK 不主动请求输出思考摘要。
+- 当前原生接口每轮通过 `contents` 传入所需历史和新问题；它不会根据本地 `sessionId` 恢复会话。Google SDK 的 chat 辅助对象可以代管历史，本项目直接调用 REST，需由调用方管理 `Session::messages`。
+- 每轮保留所需的 `System` 消息，Provider 将其放入独立的 `systemInstruction`；`Assistant` 转为 `model`，`User` 转为 `user`，连续同角色文本合并为多个 `parts`。不要把系统指令混作用户历史。
+- 成功后将最终回复作为一条 `Assistant` 消息保存，下一轮重发所需历史；流式回复同样只保存一次完整文本。裁剪历史时需考虑模型的上下文长度。
+- Gemini 的思考签名 `thoughtSignature` 是不透明的协议数据，不能用普通文本代替。当前 `Message` 不保存原始 `parts` 或签名，也不支持工具结果；要求保留签名的思考延续、工具调用或多模态会话不能靠当前文本历史完整还原。
+
+依据：[Gemini API](https://ai.google.dev/api/generate-content)、[GenerateContent 文本生成](https://ai.google.dev/gemini-api/docs/generate-content/text-generation)、[推理级别](https://ai.google.dev/gemini-api/docs/generate-content/thinking)、[思考签名](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)。
 
 ### 8.4 Ollama 原生协议
 
@@ -1274,14 +1334,15 @@ POST http://127.0.0.1:11434/api/chat
 
 **请求体参数**
 
-| 参数                                        | 是否必填          | 当前封装的含义                                                  |
-| ------------------------------------------- | ----------------- | --------------------------------------------------------------- |
-| `model`                                   | 是                | 已安装的完整模型名，包含实际版本或量化标签                      |
-| `messages`                                | 是                | 当前封装支持 System、User、Assistant 文本历史                   |
-| `messages[].role`、`messages[].content` | 是                | 消息角色与文本                                                  |
-| `stream`                                  | Provider 总是发送 | 普通为 `false`，流式为 `true`；原生 API 的默认值是 `true` |
-| `options.temperature`                     | 否                | 采样温度，放在 `options` 中                                   |
-| `options.num_predict`                     | 否                | 由 `maxOutputTokens` 映射出的输出上限                         |
+| 参数                                        | 是否必填          | 当前封装的含义                                                                         |
+| ------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------- |
+| `model`                                   | 是                | 已安装的完整模型名，包含实际版本或量化标签                                             |
+| `messages`                                | 是                | 当前封装支持 System、User、Assistant 文本历史                                          |
+| `messages[].role`、`messages[].content` | 是                | 消息角色与文本                                                                         |
+| `stream`                                  | Provider 总是发送 | 普通为 `false`，流式为 `true`；原生 API 的默认值是 `true`                        |
+| `options.temperature`                     | 否                | 采样温度，放在 `options` 中                                                          |
+| `options.num_predict`                     | 否                | 由 `maxOutputTokens` 映射出的输出上限                                                |
+| `think`                                   | 否                | `reasoningEffort` 字符串或 `thinkingEnabled` 布尔值；位于顶层，不在 `options` 内 |
 
 ```json
 {
@@ -1327,5 +1388,13 @@ POST http://127.0.0.1:11434/api/chat
 
 NDJSON 没有 SSE 的 `data:` 前缀，也没有 `[DONE]`。最后一条记录可以同时含有新增文本、
 结束状态和统计信息，应先处理文本，再处理结束状态。
+
+**推理与历史会话注意事项**
+
+- 模型支持布尔开关时，设置 `thinkingEnabled = true` 或 `false`；支持分级时，改用 `reasoningEffort`。两者不能同时设置，因为都会映射到同一个 `think` 字段。
+- 字符串级别由模型定义，可通过 Ollama 的 `/api/show` 查看支持值，不能假定每个模型都接受 `low/medium/high`。未设置时不发送 `think`，沿用模型默认行为；非思考模型不能因此获得推理能力。
+- 本地运行也需要每次把所需历史放进 `messages`。模型常驻内存或服务端缓存不会替应用维护这个 SDK 的会话；`keep_alive` 控制模型驻留，与聊天历史管理不同。
+- 每轮发送必要的 `System` 设定、之前的 `User` / `Assistant` 文本以及新问题；SDK 不自动保存和追加消息。成功后把最终回复追加为一条 `Assistant`，流式片段只用于展示，完整回复只保存一次。
+- 上下文仍受本地模型窗口限制，长会话由客户端裁剪或摘要。当前封装忽略响应的 `message.thinking`，不保存完整工具调用结构，并拒绝 `Tool` 消息；需要这些协议数据的会话不能只用当前文本历史恢复。
 
 依据：[Ollama Chat](https://docs.ollama.com/api/chat)、[Ollama 流式协议](https://docs.ollama.com/api/streaming)。
