@@ -196,7 +196,7 @@ namespace modelBridge
             stage = "解析回复或完成回调";
             if (stream)
             {
-                decoder.finish();
+                decoder.finish(); // 处理缓冲区尚未解析的数据
                 if (!finished || (protocol == ApiProtocol::OpenAICompatible && !receivedDone))
                 {
                     throw std::runtime_error("Model stream ended without complete termination information");
@@ -211,7 +211,6 @@ namespace modelBridge
         }
         catch (...)
         {
-            // 回调可能抛出含业务数据的异常，日志只记录阶段，异常原样交给调用方。
             MB_LOG_ERROR("模型请求失败：model={}，阶段={}，HTTP={}，传输状态={}", config.model.modelName, stage, status, httplib::to_string(transportError));
             throw;
         }
