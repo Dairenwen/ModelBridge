@@ -66,30 +66,35 @@ namespace modelBridge
         /** @brief 清空已完成的对话历史，保留系统提示词。 */
         void clearHistory();
 
-        /** @brief 获取已完成的 User/Assistant 消息，不包含系统提示词；不要跨后续修改持有其中元素的引用。 */
+        /** @brief 获取 User/Assistant/Tool 历史，不包含系统提示词；元素引用可能随发送失效。 */
         const std::vector<Message> &getHistory() const;
+
+        /** @brief 注册工具声明及实现；空列表表示关闭工具调用。 */
+        void setTools(const std::vector<Tool> &value);
 
         /**
          * @brief 自动携带历史，发送当前消息并等待一次性回复。
          * @param message 当前用户消息。
-         * @return 完整回复文本；成功后保存本轮问答，请求失败则保留原历史。
+         * @return content 为本次全部可见文本，messages 为本次 User/Assistant/Tool 消息链。
+         * 后续请求失败时，已经执行的工具结果仍保留。
          */
-        virtual std::string sendMessage(const std::string &message);
+        virtual ChatResult sendMessage(const std::string &message);
 
         /**
          * @brief 自动携带历史并接收文本增量；本方法阻塞，回调在调用线程执行。
          * @param message 当前用户消息。
          * @param callback 增量回调，不能为空；保存本轮问答后调用一次 ("", true)。
-         * @return 拼接后的完整文本；请求或增量回调失败时不保存本轮问答。
+         * @return content 为增量拼接文本，messages 为本次完整消息链。失败时不保存未完成的响应，已完成工具步骤仍保留。
          * 结束回调抛出异常时，本轮历史已经保存，不回滚。
          */
-        virtual std::string sendMessageStream(const std::string &message, const StreamCallback &callback);
+        virtual ChatResult sendMessageStream(const std::string &message, const StreamCallback &callback);
 
         /** @brief 获取子类使用的协议。@return 对应的 ApiProtocol。 */
         virtual ApiProtocol getProtocol() const = 0;
 
     protected:
-        ModelConfig config{}; ///< 当前连接配置；只在初始化或显式设置密钥时修改。
+        ModelConfig config{};    ///< 当前连接配置；只在初始化或显式设置密钥时修改。
+        std::vector<Tool> tools; ///< 当前可用工具，不属于模型连接参数。
 
         /**
          * @brief 构造协议请求体。
@@ -110,31 +115,41 @@ namespace modelBridge
          * @brief 从完整响应或一个流事件中读取文本，遇到服务端错误时抛出异常。
          * @param payload 已解析的 JSON。
          * @param stream 是否流事件。
+         * @param reply 当前 HTTP 响应中累积的工具调用、思考内容和原生元数据。
          * @param finished 输出协议是否明确结束；OpenAI 的 [DONE] 在公共层处理。
          * @return 新增文本，不包含模型的思考过程。
          */
-        virtual std::string readResponse(const Json::Value &payload, bool stream, bool &finished) const = 0;
+        virtual std::string readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const = 0;
+
+        // 只有 OpenAI 兼容协议需要 Chat -> Responses 的单次回退。
+        virtual bool tryProtocolFallback(const Json::Value &) { return false; }
+        virtual void resetProtocol() {}
+        virtual bool requiresDoneMarker() const { return false; }
 
     private:
         bool configurationValid = false; ///< 模型、地址及参数是否通过本地校验。
         std::string lastError;           ///< 初始化错误
         std::string systemPrompt;        ///< 系统提示词，发送时放在消息列表最前面。
-        std::vector<Message> history;    ///< 仅保存已完成的 User/Assistant 消息。
+        std::vector<Message> history;    ///< 已收到的模型消息和已执行的工具结果。
 
         /** @brief 用系统提示词、历史副本和当前用户消息构造请求，不修改已保存的历史。 */
         std::vector<Message> buildMessages(const std::string &message) const;
 
+        /** @brief 统一处理本轮请求、工具执行及历史保存，直到模型不再请求工具。 */
+        ChatResult performRequest(const std::string &message, bool stream, const StreamCallback &callback);
+
         /**
-         * @brief 执行公共 HTTP 流程
+         * @brief 发送单轮 HTTP 请求，处理协议回退并解析回复。
          * @param messages 历史消息。
          * @param stream 流式开关。
          * @param callback 增量回调。
-         * @return 回复文本。
+         * @return 完整 Assistant 消息。
          */
-        std::string performRequest(const std::vector<Message> &messages, bool stream, const StreamCallback &callback);
+        Message requestOnce(const std::vector<Message> &messages, bool stream, const StreamCallback &callback);
+        void saveHistory(const std::vector<Message> &messages);
     };
 
-    /// OpenAI Chat Completions 兼容协议，也可用于百炼、DeepSeek 和兼容的中转服务
+    /// 优先 Chat Completions；明确不支持协议时回退 Responses，并在本次初始化期间沿用。
     class OpenAICompatibleProvider : public LLMProvider
     {
     public:
@@ -146,10 +161,16 @@ namespace modelBridge
     protected:
         /// 构造 messages 及顶层生成参数，参数和返回值含义同基类。
         Json::Value makeRequestBody(const std::vector<Message> &messages, bool stream) const override;
-        /// 返回 /chat/completions，stream 不改变路径。
+        /// 返回 /chat/completions 或回退后的 /responses，stream 不改变路径。
         std::string makeRequestPath(bool stream) const override;
-        /// 读取 choices[0].message 或 choices[0].delta，其他参数含义同基类。
-        std::string readResponse(const Json::Value &payload, bool stream, bool &finished) const override;
+        /// 读取 Chat 文本/工具增量或 Responses 事件，其他参数含义同基类。
+        std::string readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const override;
+        bool tryProtocolFallback(const Json::Value &error) override;
+        void resetProtocol() override { responses = false; }
+        bool requiresDoneMarker() const override { return !responses; }
+
+    private:
+        bool responses = false; // 先尝试Chat Completions，如果请求失败会调用response
     };
 
     /// Gemini 原生 generateContent / streamGenerateContent 协议。
@@ -166,7 +187,7 @@ namespace modelBridge
         /// 根据 stream 选择普通或 SSE 路径，模型标识会进行 URL 编码。
         std::string makeRequestPath(bool stream) const override;
         /// 读取首个候选的文本 parts，忽略 thought 内容并检查拦截结果。
-        std::string readResponse(const Json::Value &payload, bool stream, bool &finished) const override;
+        std::string readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const override;
     };
 
     /// Ollama 原生 /api/chat 协议，支持无认证的本地服务。
@@ -182,7 +203,7 @@ namespace modelBridge
         /// 返回 /api/chat；baseUrl 已以 /api 结尾时只追加 /chat。
         std::string makeRequestPath(bool stream) const override;
         /// 读取 message.content 和 done，参数及返回值含义同基类。
-        std::string readResponse(const Json::Value &payload, bool stream, bool &finished) const override;
+        std::string readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const override;
     };
 
 }

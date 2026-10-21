@@ -2,6 +2,8 @@
 #include "Util.hpp"
 #include <httplib.h>
 #include <json/json.h>
+#include <algorithm>
+#include <sstream>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -48,6 +50,7 @@ namespace modelBridge
             configurationValid = true;
 
             MB_LOG_INFO("模型初始化成功：model={}", config.model.modelName);
+            resetProtocol();
             clearHistory(); // 重新初始化成功后开始新对话，保留系统提示词。
             return true;
         }
@@ -104,32 +107,77 @@ namespace modelBridge
         return messages;
     }
 
-    std::string LLMProvider::sendMessage(const std::string &message)
+    void LLMProvider::setTools(const std::vector<Tool> &value)
     {
-        auto messages = buildMessages(message);
-        auto reply = performRequest(messages, false, {});
-        messages.push_back({MessageRole::Assistant, reply, currentTimeMillis(), {}, {}});
-        if (messages.front().role == MessageRole::System)
-            messages.erase(messages.begin());
-        history.swap(messages); // 整轮成功后统一提交，系统提示词不存入对话历史。
-        return reply;
+        tools = value;
     }
 
-    std::string LLMProvider::sendMessageStream(const std::string &message, const StreamCallback &callback)
+    ChatResult LLMProvider::sendMessage(const std::string &message)
+    {
+        return performRequest(message, false, {});
+    }
+
+    ChatResult LLMProvider::sendMessageStream(const std::string &message, const StreamCallback &callback)
     {
         if (!callback)
             throw std::invalid_argument("Stream callback is required");
-        auto messages = buildMessages(message);
-        auto reply = performRequest(messages, true, callback);
-        messages.push_back({MessageRole::Assistant, reply, currentTimeMillis(), {}, {}});
-        if (messages.front().role == MessageRole::System)
-            messages.erase(messages.begin());
-        history.swap(messages);
-        callback("", true); // 先保存历史，再通知调用方完成
-        return reply;
+        auto result = performRequest(message, true, callback);
+        callback("", true); // 整条工具链保存后，只通知一次完成。
+        return result;
     }
 
-    std::string LLMProvider::performRequest(const std::vector<Message> &messages, bool stream, const StreamCallback &callback)
+    void LLMProvider::saveHistory(const std::vector<Message> &messages)
+    {
+        auto begin = messages.begin();
+        if (begin != messages.end() && begin->role == MessageRole::System) // 不保存系统消息
+            ++begin;
+        std::vector<Message> saved(begin, messages.end());
+        history.swap(saved);
+    }
+
+    ChatResult LLMProvider::performRequest(const std::string &message, bool stream, const StreamCallback &callback)
+    {
+        auto messages = buildMessages(message);
+        ChatResult result;
+        result.messages.push_back(messages.back());
+        for (;;)
+        {
+            auto reply = requestOnce(messages, stream, callback);
+            messages.push_back(reply);
+            result.messages.push_back(reply);
+            result.content += reply.content;
+            saveHistory(messages);
+            if (reply.toolCalls.empty())
+                return result;
+
+            // 每轮先执行全部工具，再将全部结果一起交回模型。
+            for (const auto &call : reply.toolCalls)
+            {
+                Message output{MessageRole::Tool, {}, currentTimeMillis(), call.id, call.name};
+                const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool &entry)
+                                               { return entry.name == call.name; });
+                try
+                {
+                    if (tool == tools.end() || !tool->execute)
+                        output.content = "{\"error\":\"Tool is not registered\"}";
+                    else
+                        output.content = tool->execute(call.arguments);
+                }
+                catch (const std::exception &error)
+                {
+                    Json::Value failure;
+                    failure["error"] = error.what();
+                    output.content = compactJson(failure);
+                }
+                messages.push_back(output);
+                result.messages.push_back(output);
+                // 已执行的工具不因后续 HTTP 失败而从历史消失，避免重试时重复执行
+                saveHistory(messages);
+            }
+        }
+    }
+
+    Message LLMProvider::requestOnce(const std::vector<Message> &messages, bool stream, const StreamCallback &callback)
     {
         const auto started = std::chrono::steady_clock::now();
         const char *stage = "检查配置";
@@ -174,7 +222,7 @@ namespace modelBridge
             // 2. 流式事件只回调文本增量；外层保存历史后再发出完成通知。
             bool finished = false;
             bool receivedDone = false;
-            std::string result;
+            Message result{MessageRole::Assistant, {}, currentTimeMillis(), {}, {}};
             StreamDecoder decoder;
             decoder.ndjson = protocol == ApiProtocol::Ollama;
             if (stream)
@@ -193,8 +241,8 @@ namespace modelBridge
                     if (receivedDone)
                         throw std::runtime_error("Data received after stream completion");
 
-                    const auto delta = readResponse(parseJson(event), true, finished);
-                    result += delta;
+                    const auto delta = readResponse(parseJson(event), true, result, finished);
+                    result.content += delta;
 
                     if (!delta.empty())
                         callback(delta, false);
@@ -228,6 +276,14 @@ namespace modelBridge
             if (status < 200 || status >= 300)
             {
                 const auto &body = stream ? errorBody : response->body;
+                Json::Value error;
+                Json::CharReaderBuilder reader;
+                std::istringstream input(body);
+                std::string diagnostics;
+                // 只在 HTTP 明确拒绝当前协议时回退；传输失败、鉴权和限流不重发。
+                if ((status == 400 || status == 404 || status == 405) &&
+                    Json::parseFromStream(reader, input, &error, &diagnostics) && tryProtocolFallback(error))
+                    return requestOnce(messages, stream, callback);
                 throw std::runtime_error("Model HTTP status " + std::to_string(status) + ": " + body);
             }
 
@@ -236,15 +292,15 @@ namespace modelBridge
             if (stream)
             {
                 decoder.finish(); // 处理缓冲区尚未解析的数据
-                if (!finished || (protocol == ApiProtocol::OpenAICompatible && !receivedDone))
+                if (!finished || (requiresDoneMarker() && !receivedDone))
                 {
                     throw std::runtime_error("Model stream ended without complete termination information");
                 }
             }
             else
-                result = readResponse(parseJson(response->body), false, finished);
+                result.content = readResponse(parseJson(response->body), false, result, finished);
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
-            MB_LOG_INFO("模型请求完成：model={}，HTTP={}，回复字节数={}，耗时={}ms", config.model.modelName, status, result.size(), elapsed);
+            MB_LOG_INFO("模型请求完成：model={}，HTTP={}，回复字节数={}，耗时={}ms", config.model.modelName, status, result.content.size(), elapsed);
             return result;
         }
         catch (...)
@@ -257,63 +313,156 @@ namespace modelBridge
     // OpenAI 兼容协议：OpenAI、DeepSeek、百炼
     ApiProtocol OpenAICompatibleProvider::getProtocol() const { return ApiProtocol::OpenAICompatible; }
 
-    /// 普通与流式调用共用 /chat/completions
-    std::string OpenAICompatibleProvider::makeRequestPath(bool) const { return "/chat/completions"; }
+    std::string OpenAICompatibleProvider::makeRequestPath(bool) const
+    {
+        return responses ? "/responses" : "/chat/completions";
+    }
 
-    /// 生成 messages 和顶层参数，思考开关按平台转换。
+    bool OpenAICompatibleProvider::tryProtocolFallback(const Json::Value &error)
+    {
+        const auto code = error["error"].get("code", "").asString();
+        if (responses || (code != "protocol_not_supported" && code != "unsupported_protocol" && code != "unsupported_endpoint"))
+            return false;
+        responses = true;
+        MB_LOG_INFO("当前渠道不支持 Chat Completions，改用 Responses");
+        return true;
+    }
+
     Json::Value OpenAICompatibleProvider::makeRequestBody(const std::vector<Message> &messages, bool stream) const
     {
         Json::Value body;
         body["model"] = config.model.modelName;
-        body["messages"] = makeChatMessages(messages, getProtocol());
         body["stream"] = stream;
         if (config.temperature)
             body["temperature"] = *config.temperature;
+        if (!responses)
+        {
+            body["messages"] = makeChatMessages(messages, getProtocol());
+            if (!tools.empty())
+                body["tools"] = chatTools(tools);
+            if (config.maxOutputTokens)
+                body[config.model.provider == ProviderType::OpenAI ? "max_completion_tokens" : "max_tokens"] = *config.maxOutputTokens;
+            if (config.reasoningEffort)
+                body["reasoning_effort"] = *config.reasoningEffort;
+            if (config.thinkingEnabled.has_value())
+            {
+                if (config.model.provider == ProviderType::DeepSeek)
+                    body["thinking"]["type"] = *config.thinkingEnabled ? "enabled" : "disabled";
+                else
+                    body["enable_thinking"] = *config.thinkingEnabled;
+            }
+            return body;
+        }
+
+        body["store"] = false; // 历史由 SDK 管理，不依赖服务端会话。
+        body["include"].append("reasoning.encrypted_content");
+        body["input"] = Json::Value(Json::arrayValue);
+        for (const auto &message : messages)
+        {
+            if (message.role == MessageRole::Assistant && !message.protocolData.empty())
+            {
+                const auto native = parseJson(message.protocolData, false);
+                for (const auto &item : native["output"])
+                    body["input"].append(item);
+                continue;
+            }
+            Json::Value item;
+            if (message.role == MessageRole::Tool)
+            {
+                item["type"] = "function_call_output";
+                item["call_id"] = message.toolCallId;
+                item["output"] = message.content;
+                body["input"].append(item);
+                continue;
+            }
+            if (!message.content.empty() || message.toolCalls.empty())
+            {
+                item["role"] = roleName(message.role);
+                item["content"] = message.content;
+                body["input"].append(item);
+            }
+            for (const auto &call : message.toolCalls)
+            {
+                Json::Value function;
+                function["type"] = "function_call";
+                function["call_id"] = call.id;
+                function["name"] = call.name;
+                function["arguments"] = call.arguments;
+                body["input"].append(function);
+            }
+        }
+        if (!tools.empty())
+        {
+            body["tools"] = Json::Value(Json::arrayValue);
+            for (const auto &tool : tools)
+            {
+                auto entry = functionSchema(tool);
+                entry["type"] = "function";
+                entry["strict"] = false;
+                body["tools"].append(entry);
+            }
+        }
         if (config.maxOutputTokens)
-            body[config.model.provider == ProviderType::OpenAI ? "max_completion_tokens" : "max_tokens"] = *config.maxOutputTokens;
+            body["max_output_tokens"] = *config.maxOutputTokens;
         if (config.reasoningEffort)
-            body["reasoning_effort"] = *config.reasoningEffort;
+            body["reasoning"]["effort"] = *config.reasoningEffort;
         if (config.thinkingEnabled.has_value())
         {
             if (config.model.provider == ProviderType::DeepSeek)
-                body["thinking"]["type"] = *config.thinkingEnabled ? "enabled" : "disabled";
+                body["reasoning"]["effort"] = *config.thinkingEnabled ? config.reasoningEffort.value_or("high") : "none";
             else
-                body["enable_thinking"] = *config.thinkingEnabled; // 初始化已限定为百炼
+                body["enable_thinking"] = *config.thinkingEnabled; // 百炼扩展
         }
         return body;
     }
 
-    /// 普通回复取 message.content，流式取 delta.content；忽略思考过程和用量事件。
-    std::string OpenAICompatibleProvider::readResponse(const Json::Value &payload, bool stream, bool &finished) const
+    std::string OpenAICompatibleProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const
     {
+        if (responses)
+        {
+            const auto type = payload.get("type", "").asString();
+            if (stream && type == "response.output_text.delta")
+                return readText(payload["delta"]);
+            if (stream && type != "response.completed" && type != "response.incomplete" && type != "response.failed")
+                return {}; // 最终 response.output 包含完整调用参数和原生推理项。
+            const auto &response = stream ? payload["response"] : payload;
+            const auto status = response.get("status", "").asString();
+            if (status != "completed" && status != "incomplete")
+                throw std::runtime_error("Responses request did not complete successfully");
+            const auto text = readResponseOutput(response["output"], reply);
+            if (status == "incomplete" && !reply.toolCalls.empty())
+                throw std::runtime_error("Tool call was truncated");
+            finished = true;
+            return stream && !reply.content.empty() ? std::string{} : text;
+        }
+
         const auto &choices = payload["choices"];
         if (!choices.isArray() || (!stream && choices.empty()))
             throw std::runtime_error("Missing chat choices");
         if (choices.empty())
-            return {}; // 流末尾可能只有用量统计。
+            return {};
         const auto &message = choices[0][stream ? "delta" : "message"];
         const auto reason = choices[0].get("finish_reason", "").asString();
         if (!message.isObject())
             throw std::runtime_error("Missing assistant message");
-        if (reason == "content_filter" || reason == "tool_calls" || reason == "function_call" ||
-            !message["tool_calls"].empty() || !message["function_call"].isNull())
-            throw std::runtime_error("Response was blocked or requires tools unsupported by the text interface");
+        if (reason == "content_filter")
+            throw std::runtime_error("Response was blocked");
+        readToolCalls(message["tool_calls"], stream, false, reply);
+        reply.reasoningContent += readText(message["reasoning_content"]);
         if (reason == "length")
+        {
+            if (!reply.toolCalls.empty())
+                throw std::runtime_error("Tool call was truncated");
             MB_LOG_WARN("模型回复达到输出上限：model={}", config.model.modelName);
-
+        }
         if (!reason.empty())
         {
-            // 工具调用和内容过滤已经在上方单独处理。
-            if (reason != "stop" && reason != "length")
+            if (reason != "stop" && reason != "length" && reason != "tool_calls")
                 throw std::runtime_error("Unsupported finish_reason: " + reason);
-
             finished = true;
         }
         else if (!stream)
-        {
             throw std::runtime_error("Non-streaming response is missing finish_reason");
-        }
-
         return readText(message["content"]) + readText(message["refusal"]);
     }
 
@@ -340,25 +489,63 @@ namespace modelBridge
         contents = Json::Value(Json::arrayValue);
         for (const auto &message : messages)
         {
-            Json::Value part;
-            part["text"] = message.content;
             if (message.role == MessageRole::System)
             {
+                Json::Value part;
+                part["text"] = message.content;
                 body["systemInstruction"]["parts"].append(part);
                 continue;
             }
-            if (message.role != MessageRole::User && message.role != MessageRole::Assistant)
-                throw std::invalid_argument("Gemini text interface supports System, User and Assistant messages");
+            Json::Value parts(Json::arrayValue);
+            if (message.role == MessageRole::Tool)
+            {
+                Json::Value part;
+                part["functionResponse"]["name"] = message.toolName;
+                part["functionResponse"]["response"]["result"] = message.content;
+                if (!message.toolCallId.empty())
+                    part["functionResponse"]["id"] = message.toolCallId;
+                parts.append(part);
+            }
+            else if (message.role == MessageRole::Assistant && !message.protocolData.empty())
+                parts = parseJson(message.protocolData, false)["parts"];
+            else
+            {
+                if (!message.content.empty())
+                {
+                    Json::Value part;
+                    part["text"] = message.content;
+                    parts.append(part);
+                }
+                for (const auto &call : message.toolCalls)
+                {
+                    Json::Value part;
+                    part["functionCall"]["name"] = call.name;
+                    part["functionCall"]["args"] = parseJson(call.arguments, false);
+                    if (!call.id.empty())
+                        part["functionCall"]["id"] = call.id;
+                    parts.append(part);
+                }
+            }
             const auto role = message.role == MessageRole::Assistant ? "model" : "user";
             if (!contents.empty() && contents[contents.size() - 1]["role"] == role)
-                contents[contents.size() - 1]["parts"].append(part); // 合并连续同角色消息。
+            {
+                for (const auto &part : parts)
+                    contents[contents.size() - 1]["parts"].append(part);
+            }
             else
             {
                 Json::Value item;
                 item["role"] = role;
-                item["parts"].append(part);
+                item["parts"] = parts;
                 contents.append(item);
             }
+        }
+        if (!tools.empty())
+        {
+            Json::Value declarations;
+            for (const auto &tool : tools)
+                declarations["functionDeclarations"].append(functionSchema(tool));
+            body["tools"].append(declarations);
         }
         if (contents.empty())
             throw std::invalid_argument("Gemini requires a non-system message");
@@ -378,7 +565,7 @@ namespace modelBridge
     }
 
     /// 按顺序拼接首个候选的可见 parts，以 finishReason 判断流结束。
-    std::string GeminiProvider::readResponse(const Json::Value &payload, bool stream, bool &finished) const
+    std::string GeminiProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const
     {
         if (payload["promptFeedback"].isMember("blockReason"))
             throw std::runtime_error("Gemini blocked the prompt");
@@ -396,14 +583,24 @@ namespace modelBridge
         const auto &parts = candidate["content"]["parts"];
         if (!parts.isNull() && !parts.isArray())
             throw std::runtime_error("Invalid Gemini parts");
+        auto native = reply.protocolData.empty() ? Json::Value(Json::objectValue) : parseJson(reply.protocolData, false);
         std::string text;
         for (const auto &part : parts)
         {
+            native["parts"].append(part); // 原样保留签名、思考 part 和 functionCall。
             if (part.isMember("functionCall"))
-                throw std::runtime_error("Gemini function calls require a tool interface");
-            if (!part.get("thought", false).asBool())
+            {
+                const auto &call = part["functionCall"];
+                reply.toolCalls.push_back({call.get("id", "").asString(), call["name"].asString(), compactJson(call.get("args", Json::Value(Json::objectValue)))});
+            }
+            else if (part.get("thought", false).asBool())
+                reply.reasoningContent += readText(part["text"]);
+            else
                 text += readText(part["text"]);
         }
+        reply.protocolData = compactJson(native);
+        if (reason == "MAX_TOKENS" && !reply.toolCalls.empty())
+            throw std::runtime_error("Tool call was truncated");
         return text;
     }
 
@@ -424,6 +621,8 @@ namespace modelBridge
         body["model"] = config.model.modelName;
         body["messages"] = makeChatMessages(messages, getProtocol());
         body["stream"] = stream;
+        if (!tools.empty())
+            body["tools"] = chatTools(tools);
         if (config.temperature)
             body["options"]["temperature"] = *config.temperature;
         if (config.maxOutputTokens)
@@ -436,7 +635,7 @@ namespace modelBridge
     }
 
     /// 普通 JSON 和每条 NDJSON 使用同一结构；最终记录可同时带文本和 done=true。
-    std::string OllamaProvider::readResponse(const Json::Value &payload, bool stream, bool &finished) const
+    std::string OllamaProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const
     {
         const auto &message = payload["message"];
         if (!payload["done"].isBool() || !message.isObject())
@@ -444,10 +643,14 @@ namespace modelBridge
         finished = payload["done"].asBool();
         if (!stream && !finished)
             throw std::runtime_error("Incomplete non-streaming Ollama response");
-        if (!message["tool_calls"].empty())
-            throw std::runtime_error("Ollama tool calls require a tool interface");
+        readToolCalls(message["tool_calls"], stream, true, reply);
+        reply.reasoningContent += readText(message["thinking"]);
         if (finished && payload.get("done_reason", "").asString() == "length")
+        {
+            if (!reply.toolCalls.empty())
+                throw std::runtime_error("Tool call was truncated");
             MB_LOG_WARN("Ollama 回复达到输出上限：model={}", config.model.modelName);
+        }
         return readText(message["content"]);
     }
 } // namespace modelBridge

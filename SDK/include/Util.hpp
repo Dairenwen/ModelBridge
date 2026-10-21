@@ -10,7 +10,7 @@
 namespace modelBridge
 {
     /// 解析一个完整 JSON 对象；错误信息不带响应正文。
-    inline Json::Value parseJson(const std::string &text)
+    inline Json::Value parseJson(const std::string &text, bool checkServiceError = true)
     {
         Json::CharReaderBuilder builder;
         builder["failIfExtra"] = true;
@@ -19,7 +19,7 @@ namespace modelBridge
         std::string error;
         if (!reader->parse(text.data(), text.data() + text.size(), &value, &error) || !value.isObject())
             throw std::runtime_error("Invalid JSON object in model response");
-        if (value.isMember("error"))
+        if (checkServiceError && value.isMember("error") && !value["error"].isNull())
             throw std::runtime_error("Model service returned an error");
         return value;
     }
@@ -51,7 +51,95 @@ namespace modelBridge
         throw std::invalid_argument("Unknown message role");
     }
 
-    /// 转换共用的 role/content 结构；仅兼容协议允许携带工具结果 ID。
+    inline std::string compactJson(const Json::Value &value)
+    {
+        Json::StreamWriterBuilder writer;
+        writer["indentation"] = "";
+        return Json::writeString(writer, value);
+    }
+
+    // 头文件中的函数使用 inline，允许多个源文件共同包含。
+    inline Json::Value functionSchema(const Tool &tool)
+    {
+        Json::Value function;
+        function["name"] = tool.name;
+        function["description"] = tool.description;
+        function["parameters"] = parseJson(tool.parameters, false);
+        return function;
+    }
+
+    inline Json::Value chatTools(const std::vector<Tool> &tools)
+    {
+        Json::Value result(Json::arrayValue);
+        for (const auto &tool : tools)
+        {
+            Json::Value entry;
+            entry["type"] = "function";
+            entry["function"] = functionSchema(tool);
+            result.append(entry);
+        }
+        return result;
+    }
+
+    // Chat 的参数是字符串增量；Ollama 的参数通常是完整对象。
+    inline void readToolCalls(const Json::Value &calls, bool stream, bool ollama, Message &reply)
+    {
+        for (Json::ArrayIndex position = 0; position < calls.size(); ++position)
+        {
+            const auto &entry = calls[position];
+            const auto &function = entry["function"];
+            const auto index = stream ? entry.get("index", function.get("index", position)).asUInt() : position;
+            if (reply.toolCalls.size() <= index)
+                reply.toolCalls.resize(index + 1);
+            auto &call = reply.toolCalls[index];
+            if (entry["id"].isString() && !entry["id"].asString().empty())
+                call.id = entry["id"].asString();
+            const auto name = function.get("name", "").asString();
+            if (stream && !ollama)
+                call.name += name;
+            else if (!name.empty())
+                call.name = name;
+            const auto &arguments = function["arguments"];
+            if (arguments.isString())
+            {
+                if (stream)
+                    call.arguments += arguments.asString();
+                else
+                    call.arguments = arguments.asString();
+            }
+            else if (arguments.isObject())
+                call.arguments = compactJson(arguments);
+        }
+    }
+
+    // Responses 的完整 output 保留下来，后续请求回放推理项和调用项。
+    inline std::string readResponseOutput(const Json::Value &output, Message &reply)
+    {
+        Json::Value native;
+        native["output"] = output;
+        reply.protocolData = compactJson(native);
+        reply.toolCalls.clear();
+        std::string text;
+        for (const auto &item : output)
+        {
+            const auto type = item.get("type", "").asString();
+            if (type == "function_call")
+                reply.toolCalls.push_back({item["call_id"].asString(), item["name"].asString(), item["arguments"].asString()});
+            else if (type == "message")
+            {
+                for (const auto &part : item["content"])
+                {
+                    if (part["type"] == "output_text")
+                        text += readText(part["text"]);
+                    else if (part["type"] == "refusal")
+                        text += readText(part["refusal"]);
+                }
+            }
+        }
+        return text;
+    }
+
+    /// 转换完整消息，保留 Assistant 工具请求和后续 Tool 结果。
     inline Json::Value makeChatMessages(const std::vector<Message> &messages, ApiProtocol protocol)
     {
         Json::Value result(Json::arrayValue);
@@ -60,6 +148,22 @@ namespace modelBridge
             Json::Value item;
             item["role"] = roleName(message.role);
             item["content"] = message.content;
+            if (!message.reasoningContent.empty())
+                item[protocol == ApiProtocol::Ollama ? "thinking" : "reasoning_content"] = message.reasoningContent;
+            if (!message.toolCalls.empty())
+            {
+                item["tool_calls"] = Json::Value(Json::arrayValue);
+                for (const auto &call : message.toolCalls)
+                {
+                    Json::Value entry;
+                    entry["type"] = "function";
+                    if (!call.id.empty())
+                        entry["id"] = call.id;
+                    entry["function"]["name"] = call.name;
+                    entry["function"]["arguments"] = protocol == ApiProtocol::Ollama ? parseJson(call.arguments, false) : Json::Value(call.arguments);
+                    item["tool_calls"].append(entry);
+                }
+            }
             if (message.role == MessageRole::Tool)
             {
                 if (protocol == ApiProtocol::OpenAICompatible)
@@ -106,8 +210,7 @@ namespace modelBridge
             if (!config.reasoningEffort)
                 return;
             const bool effortEnabled = *config.reasoningEffort != "none";
-            if ((platform == ProviderType::DeepSeek && *config.thinkingEnabled != effortEnabled) ||
-                (platform == ProviderType::Bailian && !*config.thinkingEnabled && effortEnabled))
+            if ((platform == ProviderType::DeepSeek && *config.thinkingEnabled != effortEnabled)) // 这里不同平台对这里的思考深度支持不一样
                 throw std::invalid_argument("thinkingEnabled conflicts with reasoningEffort");
         }
     }

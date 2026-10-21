@@ -53,7 +53,24 @@ namespace modelBridge
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    /// 一条文本消息；会话中的排列顺序即对话顺序。
+    /// 模型发起的工具调用；arguments 保存完整 JSON 字符串。
+    struct ToolCall
+    {
+        std::string id;
+        std::string name;
+        std::string arguments;
+    };
+
+    /// 工具声明和本地实现；只有显式注册的函数会被执行。
+    struct Tool
+    {
+        std::string name;
+        std::string description;
+        std::string parameters = "{}"; // 参数的 JSON Schema。
+        std::function<std::string(const std::string &)> execute;
+    };
+
+    /// 会话消息，包括 Assistant 的调用请求和 Tool 的执行结果。
     struct Message
     {
         MessageRole role;       ///< 消息角色。
@@ -61,6 +78,16 @@ namespace modelBridge
         std::int64_t createdAt; ///< 创建时间，Unix 毫秒。
         std::string toolCallId; ///< Tool 消息关联的工具调用 ID，其他角色留空。
         std::string toolName;   ///< ollama工具调用字段
+        std::vector<ToolCall> toolCalls; ///< Assistant 请求的全部工具调用。
+        std::string reasoningContent;   ///< 工具会话中需要回传的思考内容。
+        std::string protocolData;       ///< 原生 parts/output，保留 Gemini 签名、Responses 推理项等。
+    };
+
+    /// 一次发送的完整结果；messages 只包含本次新增的消息，不含系统提示词。
+    struct ChatResult
+    {
+        std::string content; // 本次全部 Assistant 可见文本，顺序与流式回调一致。
+        std::vector<Message> messages;
     };
 
     /// 模型的基本信息，不包含连接密钥。

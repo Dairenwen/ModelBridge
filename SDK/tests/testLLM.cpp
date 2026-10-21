@@ -8,11 +8,29 @@ using namespace modelBridge;
 
 namespace
 {
-    OpenAICompatibleProvider provider;
-    ModelConfig testConfig; // 在 main 中保存完整配置，供不同思考模式的测试复用
+    // OpenAICompatibleProvider provider;
+    OllamaProvider provider;
+    using TestProvider = decltype(provider); // 思考测试跟随主测试使用的 Provider 类型。
+    ModelConfig testConfig;                  // 在 main 中保存完整配置，供不同思考模式的测试复用
+
+    void expectThinking(const Json::Value &request, bool enabled)
+    {
+        if (testConfig.model.protocol == ApiProtocol::Ollama)
+        {
+            ASSERT_TRUE(request["think"].isBool());
+            EXPECT_EQ(request["think"].asBool(), enabled);
+        }
+        else if (testConfig.model.provider == ProviderType::Bailian)
+        {
+            ASSERT_TRUE(request["enable_thinking"].isBool());
+            EXPECT_EQ(request["enable_thinking"].asBool(), enabled);
+        }
+        else
+            EXPECT_EQ(request["thinking"]["type"].asString(), enabled ? "enabled" : "disabled");
+    }
 
     // 仅在测试中观察请求字段和思考内容长度，仍使用 SDK 原有的构造、解析和 HTTP 流程。
-    class ThinkingTestProvider : public OpenAICompatibleProvider
+    class ThinkingTestProvider : public TestProvider
     {
     public:
         mutable Json::Value lastRequest;
@@ -21,16 +39,16 @@ namespace
     protected:
         Json::Value makeRequestBody(const std::vector<Message> &messages, bool stream) const override
         {
-            lastRequest = OpenAICompatibleProvider::makeRequestBody(messages, stream);
+            lastRequest = TestProvider::makeRequestBody(messages, stream);
             return lastRequest;
         }
 
-        std::string readResponse(const Json::Value &payload, bool stream, bool &finished) const override
+        std::string readResponse(const Json::Value &payload, bool stream, Message &replyMessage, bool &finished) const override
         {
-            auto reply = OpenAICompatibleProvider::readResponse(payload, stream, finished);
-            const auto &thinking = payload["choices"][0][stream ? "delta" : "message"]["reasoning_content"];
-            if (thinking.isString())
-                thinkingBytes += thinking.asString().size();
+            const auto previousSize = replyMessage.reasoningContent.size();
+            auto reply = TestProvider::readResponse(payload, stream, replyMessage, finished);
+            // 各协议解析后统一保存至 reasoningContent，只统计本次新增内容。
+            thinkingBytes += replyMessage.reasoningContent.size() - previousSize;
             return reply;
         }
     };
@@ -47,21 +65,21 @@ namespace
         const auto firstMessage = "请记住本轮对话的代号：" + code + "。只回答收到。";
         const std::string secondMessage = "上一条用户消息中的代号是什么？只返回该代号。";
         const auto firstReply = provider.sendMessage(firstMessage);
-        ASSERT_FALSE(firstReply.empty());
+        ASSERT_FALSE(firstReply.content.empty());
         const auto reply = provider.sendMessage(secondMessage);
 
-        EXPECT_NE(reply.find(code), std::string::npos); // 当前消息未重复代号，回答需依赖历史。
+        EXPECT_NE(reply.content.find(code), std::string::npos); // 当前消息未重复代号，回答需依赖历史。
         const auto &history = provider.getHistory();
         ASSERT_EQ(history.size(), 4u);
         EXPECT_EQ(history[0].role, MessageRole::User);
         EXPECT_EQ(history[0].content, firstMessage);
         EXPECT_EQ(history[1].role, MessageRole::Assistant);
-        EXPECT_EQ(history[1].content, firstReply);
+        EXPECT_EQ(history[1].content, firstReply.content);
         EXPECT_EQ(history[2].role, MessageRole::User);
         EXPECT_EQ(history[2].content, secondMessage);
         EXPECT_EQ(history[3].role, MessageRole::Assistant);
-        EXPECT_EQ(history[3].content, reply);
-        std::cout << "全量回复：" << reply << '\n';
+        EXPECT_EQ(history[3].content, reply.content);
+        std::cout << "全量回复：" << reply.content << '\n';
     }
 
     TEST(LLMTest, StreamResponse)
@@ -71,7 +89,7 @@ namespace
         const auto firstMessage = "请记住本轮对话的代号：" + code + "。只回答收到。";
         const std::string secondMessage = "上一条用户消息中的代号是什么？只返回该代号。";
         const auto firstReply = provider.sendMessageStream(firstMessage, [](const std::string &, bool) {});
-        ASSERT_FALSE(firstReply.empty());
+        ASSERT_FALSE(firstReply.content.empty());
         std::string received;
         int doneCount = 0;
         std::cout << "流式回复：" << std::flush;
@@ -89,19 +107,19 @@ namespace
                 } });
         std::cout << '\n';
 
-        EXPECT_NE(reply.find(code), std::string::npos);
-        EXPECT_EQ(reply, received);
+        EXPECT_NE(reply.content.find(code), std::string::npos);
+        EXPECT_EQ(reply.content, received);
         EXPECT_EQ(doneCount, 1);
         const auto &history = provider.getHistory();
         ASSERT_EQ(history.size(), 4u);
         EXPECT_EQ(history[0].role, MessageRole::User);
         EXPECT_EQ(history[0].content, firstMessage);
         EXPECT_EQ(history[1].role, MessageRole::Assistant);
-        EXPECT_EQ(history[1].content, firstReply);
+        EXPECT_EQ(history[1].content, firstReply.content);
         EXPECT_EQ(history[2].role, MessageRole::User);
         EXPECT_EQ(history[2].content, secondMessage);
         EXPECT_EQ(history[3].role, MessageRole::Assistant);
-        EXPECT_EQ(history[3].content, reply);
+        EXPECT_EQ(history[3].content, reply.content);
     }
 
     TEST(LLMTest, ThinkingMode)
@@ -117,8 +135,8 @@ namespace
             ThinkingTestProvider thinkingProvider;
             ASSERT_TRUE(thinkingProvider.initialize(options)) << thinkingProvider.getLastError();
             const auto reply = thinkingProvider.sendMessage("一个数加 5 后乘 3 等于 36，求这个数。只回答数字。");
-            EXPECT_NE(reply.find("7"), std::string::npos);
-            EXPECT_EQ(thinkingProvider.lastRequest["thinking"]["type"].asString(), enabled ? "enabled" : "disabled");
+            EXPECT_NE(reply.content.find("7"), std::string::npos);
+            expectThinking(thinkingProvider.lastRequest, enabled);
             EXPECT_FALSE(thinkingProvider.lastRequest.isMember("reasoning_effort"));
             EXPECT_EQ(thinkingProvider.thinkingBytes > 0, enabled);
             std::cout << "thinkingEnabled=" << std::boolalpha << enabled << "，全量思考字节数=" << thinkingProvider.thinkingBytes << '\n';
@@ -132,8 +150,8 @@ namespace
                     received += delta;
                     if (done)
                         ++doneCount; });
-            EXPECT_NE(streamReply.find("14"), std::string::npos);
-            EXPECT_EQ(streamReply, received);
+            EXPECT_NE(streamReply.content.find("14"), std::string::npos);
+            EXPECT_EQ(streamReply.content, received);
             EXPECT_EQ(doneCount, 1);
             EXPECT_FALSE(thinkingProvider.lastRequest.isMember("reasoning_effort"));
             EXPECT_EQ(thinkingProvider.thinkingBytes > 0, enabled);
@@ -156,8 +174,8 @@ namespace
             ASSERT_TRUE(thinkingProvider.initialize(options)) << thinkingProvider.getLastError();
             thinkingProvider.setSystemPrompt("请简短回答。");
             const auto reply = thinkingProvider.sendMessage("7 加 8 等于多少？只回答数字。");
-            EXPECT_NE(reply.find("15"), std::string::npos);
-            EXPECT_EQ(thinkingProvider.lastRequest["thinking"]["type"].asString(), "enabled");
+            EXPECT_NE(reply.content.find("15"), std::string::npos);
+            expectThinking(thinkingProvider.lastRequest, true);
             EXPECT_EQ(thinkingProvider.lastRequest["reasoning_effort"].asString(), effort);
 
             std::string received;
@@ -168,8 +186,8 @@ namespace
                     received += delta;
                     if (done)
                         ++doneCount; });
-            EXPECT_NE(streamReply.find("16"), std::string::npos);
-            EXPECT_EQ(streamReply, received);
+            EXPECT_NE(streamReply.content.find("16"), std::string::npos);
+            EXPECT_EQ(streamReply.content, received);
             EXPECT_EQ(doneCount, 1);
             EXPECT_EQ(thinkingProvider.lastRequest["reasoning_effort"].asString(), effort);
             EXPECT_EQ(thinkingProvider.getHistory().size(), 4u);
@@ -196,13 +214,19 @@ int main(int argc, char **argv)
     // config.baseUrl = "https://api.deepseek.com";
     // config.apiKey = "sk-4cecc942640c4badbfae92b73c6eb1d5";
     // config.timeoutSeconds = 120;
+    // ModelConfig config{};
+    // config.model.modelName = "qwen3.8-flash";
+    // config.model.protocol = ApiProtocol::OpenAICompatible;
+    // config.model.provider = ProviderType::Bailian;
+    // config.baseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+    // config.apiKey = "sk-c02ef573727b4c049549c01bf7d523b2";
+    // config.timeoutSeconds = 120;
     ModelConfig config{};
-    config.model.modelName = "qwen3.8-flash";
-    config.model.protocol = ApiProtocol::OpenAICompatible;
-    config.model.provider = ProviderType::Bailian;
-    config.baseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-    config.apiKey = "sk-c02ef573727b4c049549c01bf7d523b2";
-    config.timeoutSeconds = 120;
+    config.model.modelName = "qwen3.8:27b-mlx";
+    config.model.protocol = ApiProtocol::Ollama;
+    config.model.provider = ProviderType::Ollama;
+    config.baseUrl = "http://host.docker.internal:11434";
+    config.timeoutSeconds = 300;
 
     if (!provider.initialize(config))
     {

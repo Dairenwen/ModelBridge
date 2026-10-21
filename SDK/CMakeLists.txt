@@ -18,7 +18,8 @@ file(GLOB_RECURSE SDK_HEADERS CONFIGURE_DEPENDS
 file(GLOB_RECURSE SDK_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
-# 程序入口单独构建，其余 src 下的 cpp 编入 SDK。
+
+
 list(REMOVE_ITEM SDK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 add_library(modelbridge_sdk STATIC ${SDK_SOURCES} ${SDK_HEADERS})
 target_include_directories(modelbridge_sdk
