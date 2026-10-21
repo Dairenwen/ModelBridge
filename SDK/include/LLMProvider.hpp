@@ -20,7 +20,8 @@ namespace modelBridge
     /**
      * @brief 统一的文本聊天接口；三个子类分别处理不同协议。
      * 初始化只校验本地配置，不发送计费请求，也不代表远端密钥已通过验证。
-     * 发送失败抛出异常；同一对象发送期间不要修改配置或密钥。
+     * 一个对象管理一段对话，请按顺序调用；发送失败抛出异常。
+     * 发送期间（包括增量回调中）不要再次发送，或修改配置、密钥及对话状态。
      */
     class LLMProvider
     {
@@ -59,20 +60,30 @@ namespace modelBridge
         /** @brief 获取当前密钥。@return 实际使用的密钥；调用方不可将其写入日志。 */
         const std::string &getApiKey() const;
 
-        /**
-         * @brief 发送完整历史并等待一次性回复；不修改传入历史。
-         * @param messages 按对话顺序排列的消息，不能为空。
-         * @return 完整回复文本；网络、HTTP 或协议错误时抛出异常。
-         */
-        virtual std::string sendMessage(const std::vector<Message> &messages);
+        /** @brief 设置后续请求使用的系统提示词，空字符串表示不使用。 */
+        void setSystemPrompt(const std::string &prompt);
+
+        /** @brief 清空已完成的对话历史，保留系统提示词。 */
+        void clearHistory();
+
+        /** @brief 获取已完成的 User/Assistant 消息，不包含系统提示词；不要跨后续修改持有其中元素的引用。 */
+        const std::vector<Message> &getHistory() const;
 
         /**
-         * @brief 发送历史并接收文本增量；本方法阻塞，回调在调用线程执行。
-         * @param messages 按对话顺序排列的消息，不能为空
-         * @param callback 增量回调，不能为空；成功结束仅调用一次 ("", true)。
-         * @return 拼接后的完整文本；失败时抛出异常
+         * @brief 自动携带历史，发送当前消息并等待一次性回复。
+         * @param message 当前用户消息。
+         * @return 完整回复文本；成功后保存本轮问答，请求失败则保留原历史。
          */
-        virtual std::string sendMessageStream(const std::vector<Message> &messages, const StreamCallback &callback);
+        virtual std::string sendMessage(const std::string &message);
+
+        /**
+         * @brief 自动携带历史并接收文本增量；本方法阻塞，回调在调用线程执行。
+         * @param message 当前用户消息。
+         * @param callback 增量回调，不能为空；保存本轮问答后调用一次 ("", true)。
+         * @return 拼接后的完整文本；请求或增量回调失败时不保存本轮问答。
+         * 结束回调抛出异常时，本轮历史已经保存，不回滚。
+         */
+        virtual std::string sendMessageStream(const std::string &message, const StreamCallback &callback);
 
         /** @brief 获取子类使用的协议。@return 对应的 ApiProtocol。 */
         virtual ApiProtocol getProtocol() const = 0;
@@ -107,6 +118,11 @@ namespace modelBridge
     private:
         bool configurationValid = false; ///< 模型、地址及参数是否通过本地校验。
         std::string lastError;           ///< 初始化错误
+        std::string systemPrompt;        ///< 系统提示词，发送时放在消息列表最前面。
+        std::vector<Message> history;    ///< 仅保存已完成的 User/Assistant 消息。
+
+        /** @brief 用系统提示词、历史副本和当前用户消息构造请求，不修改已保存的历史。 */
+        std::vector<Message> buildMessages(const std::string &message) const;
 
         /**
          * @brief 执行公共 HTTP 流程

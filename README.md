@@ -366,7 +366,6 @@ cp httplib.h /usr/local/include/
 
 也可以将固定版本的 `httplib.h` 放入项目的第三方依赖目录，避免依赖系统全局安装。
 
-
 ## 7. 使用 Postman 调试本地 Ollama
 
 ### 7.1 Ollama 简介

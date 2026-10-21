@@ -39,7 +39,7 @@ namespace modelBridge
                     config.apiKey = key;
             }
 
-            if (getProtocol() == ApiProtocol::Ollama || !config.apiKey.empty())
+            if (getProtocol() != ApiProtocol::Ollama && config.apiKey.empty())
                 throw std::invalid_argument("API key is required for this protocol");
 
             if (config.apiKey.find_first_of("\r\n") != std::string::npos)
@@ -48,6 +48,7 @@ namespace modelBridge
             configurationValid = true;
 
             MB_LOG_INFO("模型初始化成功：model={}", config.model.modelName);
+            clearHistory(); // 重新初始化成功后开始新对话，保留系统提示词。
             return true;
         }
         catch (const std::exception &error)
@@ -78,16 +79,54 @@ namespace modelBridge
         MB_LOG_DEBUG("模型认证信息已更新");
     }
 
-    std::string LLMProvider::sendMessage(const std::vector<Message> &messages)
+    void LLMProvider::setSystemPrompt(const std::string &prompt)
     {
-        return performRequest(messages, false, {});
+        systemPrompt = prompt;
     }
 
-    std::string LLMProvider::sendMessageStream(const std::vector<Message> &messages, const StreamCallback &callback)
+    void LLMProvider::clearHistory()
+    {
+        history.clear();
+    }
+
+    const std::vector<Message> &LLMProvider::getHistory() const
+    {
+        return history;
+    }
+
+    std::vector<Message> LLMProvider::buildMessages(const std::string &message) const
+    {
+        // 在副本上构造本轮消息，请求失败不会留下尚未完成的用户消息。
+        auto messages = history;
+        if (!systemPrompt.empty())
+            messages.insert(messages.begin(), Message{MessageRole::System, systemPrompt, currentTimeMillis(), {}, {}});
+        messages.push_back({MessageRole::User, message, currentTimeMillis(), {}, {}});
+        return messages;
+    }
+
+    std::string LLMProvider::sendMessage(const std::string &message)
+    {
+        auto messages = buildMessages(message);
+        auto reply = performRequest(messages, false, {});
+        messages.push_back({MessageRole::Assistant, reply, currentTimeMillis(), {}, {}});
+        if (messages.front().role == MessageRole::System)
+            messages.erase(messages.begin());
+        history.swap(messages); // 整轮成功后统一提交，系统提示词不存入对话历史。
+        return reply;
+    }
+
+    std::string LLMProvider::sendMessageStream(const std::string &message, const StreamCallback &callback)
     {
         if (!callback)
             throw std::invalid_argument("Stream callback is required");
-        return performRequest(messages, true, callback);
+        auto messages = buildMessages(message);
+        auto reply = performRequest(messages, true, callback);
+        messages.push_back({MessageRole::Assistant, reply, currentTimeMillis(), {}, {}});
+        if (messages.front().role == MessageRole::System)
+            messages.erase(messages.begin());
+        history.swap(messages);
+        callback("", true); // 先保存历史，再通知调用方完成
+        return reply;
     }
 
     std::string LLMProvider::performRequest(const std::vector<Message> &messages, bool stream, const StreamCallback &callback)
@@ -132,7 +171,7 @@ namespace modelBridge
             request.body = Json::writeString(writer, makeRequestBody(messages, stream));
             MB_LOG_DEBUG("模型请求体已构造：字节数={}", request.body.size());
 
-            // 2. 流式事件提取可见文本；完成通知统一在整个 HTTP 请求成功后发出。
+            // 2. 流式事件只回调文本增量；外层保存历史后再发出完成通知。
             bool finished = false;
             bool receivedDone = false;
             std::string result;
@@ -201,7 +240,6 @@ namespace modelBridge
                 {
                     throw std::runtime_error("Model stream ended without complete termination information");
                 }
-                callback("", true);
             }
             else
                 result = readResponse(parseJson(response->body), false, finished);
