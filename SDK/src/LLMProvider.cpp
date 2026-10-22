@@ -320,9 +320,19 @@ namespace modelBridge
 
     bool OpenAICompatibleProvider::tryProtocolFallback(const Json::Value &error)
     {
-        const auto code = error["error"].get("code", "").asString();
-        if (responses || (code != "protocol_not_supported" && code != "unsupported_protocol" && code != "unsupported_endpoint"))
+        if (responses || !error.isObject() || !error["error"].isObject())
             return false;
+
+        const auto &codeValue = error["error"]["code"];
+        if (!codeValue.isString())
+            return false;
+
+        const auto code = codeValue.asString();
+        if (code != "protocol_not_supported" && code != "unsupported_protocol" && code != "unsupported_endpoint")
+        {
+            return false;
+        }
+
         responses = true;
         MB_LOG_INFO("当前渠道不支持 Chat Completions，改用 Responses");
         return true;

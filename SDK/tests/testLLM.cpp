@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 using namespace modelBridge;
@@ -162,21 +163,27 @@ namespace
 
     TEST(LLMTest, ReasoningEffort)
     {
-        // 固定开启思考，仅改变深度；不以思考字节数大小判断实际推理深浅。
-        for (const std::string effort : {"low", "high"})
+        const bool ollama = testConfig.model.protocol == ApiProtocol::Ollama;
+        const std::vector<std::string> efforts = ollama ? std::vector<std::string>{"low", "xhigh"} : std::vector<std::string>{"low", "high"};
+        const char *effortField = ollama ? "think" : "reasoning_effort";
+        for (const auto &effort : efforts)
         {
             SCOPED_TRACE(effort);
             auto options = testConfig;
-            options.thinkingEnabled = true;
             options.reasoningEffort = effort;
+            options.thinkingEnabled.reset();
+            if (!ollama && (options.model.provider == ProviderType::DeepSeek ||
+                            options.model.provider == ProviderType::Bailian))
+                options.thinkingEnabled = true;
 
             ThinkingTestProvider thinkingProvider;
             ASSERT_TRUE(thinkingProvider.initialize(options)) << thinkingProvider.getLastError();
             thinkingProvider.setSystemPrompt("请简短回答。");
             const auto reply = thinkingProvider.sendMessage("7 加 8 等于多少？只回答数字。");
             EXPECT_NE(reply.content.find("15"), std::string::npos);
-            expectThinking(thinkingProvider.lastRequest, true);
-            EXPECT_EQ(thinkingProvider.lastRequest["reasoning_effort"].asString(), effort);
+            if (options.thinkingEnabled.has_value())
+                expectThinking(thinkingProvider.lastRequest, true);
+            EXPECT_EQ(thinkingProvider.lastRequest[effortField].asString(), effort);
 
             std::string received;
             int doneCount = 0;
@@ -189,8 +196,93 @@ namespace
             EXPECT_NE(streamReply.content.find("16"), std::string::npos);
             EXPECT_EQ(streamReply.content, received);
             EXPECT_EQ(doneCount, 1);
-            EXPECT_EQ(thinkingProvider.lastRequest["reasoning_effort"].asString(), effort);
+            EXPECT_EQ(thinkingProvider.lastRequest[effortField].asString(), effort);
             EXPECT_EQ(thinkingProvider.getHistory().size(), 4u);
+        }
+    }
+
+    TEST(LLMTest, OllamaToolCalls)
+    {
+        if (testConfig.model.protocol != ApiProtocol::Ollama)
+            GTEST_SKIP() << "此用例连接本地 Ollama 测试真实工具调用。";
+
+        for (const bool stream : {false, true})
+        {
+            SCOPED_TRACE(stream ? "stream tools" : "full tools");
+            OllamaProvider toolProvider;
+            ASSERT_TRUE(toolProvider.initialize(testConfig)) << toolProvider.getLastError();
+            std::vector<std::string> executions;
+            const std::string parameters = R"({"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"additionalProperties":false})";
+            toolProvider.setTools({{"add", "计算 a 与 b 的和。", parameters,
+                                    [&](const std::string &arguments)
+                                    {
+                                        Json::Value args;
+                                        std::istringstream input(arguments);
+                                        input >> args;
+                                        executions.push_back("add");
+                                        EXPECT_DOUBLE_EQ(args["a"].asDouble() + args["b"].asDouble(), 20.0);
+                                        const auto output = std::to_string(args["a"].asDouble() + args["b"].asDouble());
+                                        std::cout << "本地执行 add：" << arguments << " -> " << output << std::endl;
+                                        return output;
+                                    }},
+                                   {"multiply", "计算 a 与 b 的乘积。", parameters,
+                                    [&](const std::string &arguments)
+                                    {
+                                        Json::Value args;
+                                        std::istringstream input(arguments);
+                                        input >> args;
+                                        executions.push_back("multiply");
+                                        const double a = args["a"].asDouble(), b = args["b"].asDouble();
+                                        EXPECT_TRUE((a == 20.0 && b == 3.0) || (a == 3.0 && b == 20.0));
+                                        const auto output = std::to_string(a * b);
+                                        std::cout << "本地执行 multiply：" << arguments << " -> " << output << std::endl;
+                                        return output;
+                                    }}});
+
+            const std::string prompt = "请调用工具计算 (12 + 8) × 3。先只调用 add，收到它的结果后，"
+                                       "再调用 multiply 将结果乘以 3。最后只回答最终数字。";
+            std::string received;
+            int doneCount = 0;
+            const auto result = stream ? toolProvider.sendMessageStream(
+                                             prompt, [&](const std::string &delta, bool done)
+                                             {
+                    EXPECT_EQ(doneCount, 0);
+                    received += delta;
+                    if (done)
+                        ++doneCount; })
+                                       : toolProvider.sendMessage(prompt);
+
+            EXPECT_EQ(executions, (std::vector<std::string>{"add", "multiply"}));
+            // 两次模型调用分别请求工具，中间确实保存并回传了第一次工具结果。
+            ASSERT_EQ(result.messages.size(), 6u);
+            ASSERT_EQ(toolProvider.getHistory().size(), result.messages.size());
+            EXPECT_EQ(result.messages[0].role, MessageRole::User);
+            for (std::size_t index = 0; index < 2; ++index)
+            {
+                const auto &request = result.messages[1 + index * 2];
+                const auto &output = result.messages[2 + index * 2];
+                EXPECT_EQ(request.role, MessageRole::Assistant);
+                ASSERT_EQ(request.toolCalls.size(), 1u);
+                EXPECT_EQ(request.toolCalls[0].name, index == 0 ? "add" : "multiply");
+                EXPECT_EQ(output.role, MessageRole::Tool);
+                EXPECT_EQ(output.toolName, request.toolCalls[0].name);
+                EXPECT_EQ(output.toolCallId, request.toolCalls[0].id);
+                EXPECT_DOUBLE_EQ(std::stod(output.content), index == 0 ? 20.0 : 60.0);
+                EXPECT_EQ(toolProvider.getHistory()[2 + index * 2].content, output.content);
+            }
+            EXPECT_EQ(result.messages.back().role, MessageRole::Assistant);
+            EXPECT_EQ(result.messages.back().content, "60");
+            if (stream)
+            {
+                EXPECT_EQ(received, result.content);
+                EXPECT_EQ(doneCount, 1);
+            }
+            std::cout << (stream ? "流式" : "全量") << "工具链最终回复：" << result.content << std::endl;
+
+            toolProvider.setTools({});
+            const auto followup = toolProvider.sendMessage("上一轮最终的计算结果是多少？只回答数字。");
+            EXPECT_EQ(followup.content, "60");
+            EXPECT_EQ(executions.size(), 2u); // 回放历史没有重复执行本地工具。
         }
     }
 } // namespace
