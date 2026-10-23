@@ -73,14 +73,19 @@ namespace modelBridge
     /// 会话消息，包括 Assistant 的调用请求和 Tool 的执行结果。
     struct Message
     {
-        MessageRole role;       ///< 消息角色。
-        std::string content;    ///< UTF-8 文本内容。
-        std::int64_t createdAt; ///< 创建时间，Unix 毫秒。
-        std::string toolCallId; ///< Tool 消息关联的工具调用 ID，其他角色留空。
-        std::string toolName;   ///< ollama工具调用字段
-        std::vector<ToolCall> toolCalls; ///< Assistant 请求的全部工具调用。
-        std::string reasoningContent;   ///< 工具会话中需要回传的思考内容。
-        std::string protocolData;       ///< 原生 parts/output，保留 Gemini 签名、Responses 推理项等。
+        std::string messageId;                      ///< 会话管理器为消息记录生成的唯一 ID。
+        MessageRole role = MessageRole::User;       ///< 消息角色。
+        std::string content;                        ///< UTF-8 文本内容。
+        std::int64_t createdAt = 0;                  ///< 创建时间，Unix 毫秒；零表示由会话管理器补充。
+        std::string toolCallId;                     ///< Tool 消息关联的工具调用 ID，其他角色留空。
+        std::string toolName;                       ///< ollama工具调用字段
+        std::vector<ToolCall> toolCalls;            ///< Assistant 请求的全部工具调用。
+        std::string reasoningContent;               ///< 工具会话中需要回传的思考内容。
+        std::string protocolData;                   ///< 原生 parts/output，保留 Gemini 签名、Responses 推理项等。
+        std::string modelConfigId;                  ///< 本条消息对应的模型连接 ID，不随后续模型切换改变。
+        std::string modelName;                      ///< 本条消息对应的模型名称快照。
+        std::optional<std::string> reasoningEffort; ///< 当时指定的推理级别；未设置表示使用服务端默认值。
+        std::optional<bool> thinkingEnabled;        ///< 当时指定的思考开关；未设置表示使用服务端默认值。
     };
 
     /// 一次发送的完整结果；messages 只包含本次新增的消息，不含系统提示词。
@@ -95,8 +100,8 @@ namespace modelBridge
     {
         std::string modelName;   ///< API 使用的模型标识，本地模型需包含实际标签。
         std::string displayName; ///< 展示名称；为空时使用 modelName。
-        ApiProtocol protocol;    ///< 使用的聊天协议。
-        ProviderType provider;   ///< 服务平台；百炼和 DeepSeek 可共用兼容协议。
+        ApiProtocol protocol = ApiProtocol::OpenAICompatible;    ///< 使用的聊天协议。
+        ProviderType provider = ProviderType::Custom;   ///< 服务平台；百炼和 DeepSeek 可共用兼容协议。
         std::string description; ///< 可选的模型说明，供 Provider 查询和界面展示。
     };
 
@@ -115,8 +120,8 @@ namespace modelBridge
         std::optional<int> maxOutputTokens;         ///< 输出 Token 上限，设置时须大于零。
         std::optional<std::string> reasoningEffort; ///< 推理级别，如 low/medium/high；可用值由平台和模型决定。
         std::optional<bool> thinkingEnabled;        ///< 思考开关；用于 DeepSeek、百炼和 Ollama，未设置时沿用服务端默认值。
-        int timeoutSeconds;                         ///< 请求超时秒数，须大于零。
-        bool stream;                                ///< 是否默认使用流式回复。
+        int timeoutSeconds = 0;                         ///< 请求超时秒数，须大于零。
+        bool stream = false;                                ///< 是否默认使用流式回复。
         std::string apiKey;                         ///< 运行时直接传入的密钥
     };
 
@@ -125,10 +130,12 @@ namespace modelBridge
     {
         std::string sessionId;         ///< 会话唯一 ID。
         std::string userId;            ///< 所属用户 ID。
-        std::string modelConfigId;     ///< 使用的 ModelConfig::configId。
+        std::string modelConfigId;     ///< 最近添加消息时使用的连接 ID；创建时为初始连接 ID。
         std::string title;             ///< 会话标题。
         std::vector<Message> messages; ///< 按对话顺序保存的历史，系统提示也作为消息保存。
-        std::int64_t createdAt;        ///< 创建时间，Unix 毫秒。
+        std::int64_t createdAt = 0;        ///< 创建时间，Unix 毫秒。
+        std::int64_t updatedAt = 0;        ///< 最近添加消息或显式更新会话的时间，Unix 毫秒。
+        std::uint64_t generation = 0; ///< 清空消息时递增，阻止在途请求回写。
     };
 
     /// 用户自己的基础配置。

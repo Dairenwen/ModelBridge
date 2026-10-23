@@ -38,16 +38,16 @@ namespace
         mutable std::size_t thinkingBytes = 0;
 
     protected:
-        Json::Value makeRequestBody(const std::vector<Message> &messages, bool stream) const override
+        Json::Value makeRequestBody(const std::vector<Message> &messages, bool stream, const RequestContext &context) const override
         {
-            lastRequest = TestProvider::makeRequestBody(messages, stream);
+            lastRequest = TestProvider::makeRequestBody(messages, stream, context);
             return lastRequest;
         }
 
-        std::string readResponse(const Json::Value &payload, bool stream, Message &replyMessage, bool &finished) const override
+        std::string readResponse(const Json::Value &payload, bool stream, Message &replyMessage, bool &finished, const RequestContext &context) const override
         {
             const auto previousSize = replyMessage.reasoningContent.size();
-            auto reply = TestProvider::readResponse(payload, stream, replyMessage, finished);
+            auto reply = TestProvider::readResponse(payload, stream, replyMessage, finished, context);
             // 各协议解析后统一保存至 reasoningContent，只统计本次新增内容。
             thinkingBytes += replyMessage.reasoningContent.size() - previousSize;
             return reply;

@@ -88,7 +88,9 @@ namespace modelBridge
         {
             const auto &entry = calls[position];
             const auto &function = entry["function"];
-            const auto index = stream ? entry.get("index", function.get("index", position)).asUInt() : position;
+            // Ollama 每个分块携带完整调用，按到达顺序追加；Chat 使用 index 合并参数增量。
+            const auto index = ollama ? static_cast<Json::ArrayIndex>(reply.toolCalls.size()) :
+                (stream ? entry.get("index", function.get("index", position)).asUInt() : position);
             if (reply.toolCalls.size() <= index)
                 reply.toolCalls.resize(index + 1);
             auto &call = reply.toolCalls[index];
@@ -102,7 +104,7 @@ namespace modelBridge
             const auto &arguments = function["arguments"];
             if (arguments.isString())
             {
-                if (stream)
+                if (stream && !ollama)
                     call.arguments += arguments.asString();
                 else
                     call.arguments = arguments.asString();
@@ -137,6 +139,36 @@ namespace modelBridge
             }
         }
         return text;
+    }
+
+    /// Gemini/Ollama 允许无调用 ID；转换到 OpenAI 时在副本中补齐并关联工具结果。
+    inline std::vector<Message> withToolCallIds(std::vector<Message> messages)
+    {
+        std::vector<std::string> pending;
+        std::size_t next = 0;
+        for (std::size_t i = 0; i < messages.size(); ++i)
+        {
+            auto &message = messages[i];
+            if (message.role == MessageRole::Assistant && !message.toolCalls.empty())
+            {
+                pending.clear();
+                next = 0;
+                for (std::size_t j = 0; j < message.toolCalls.size(); ++j)
+                {
+                    auto &call = message.toolCalls[j];
+                    if (call.id.empty())
+                        call.id = "call_history_" + std::to_string(i) + "_" + std::to_string(j);
+                    pending.push_back(call.id);
+                }
+            }
+            else if (message.role == MessageRole::Tool)
+            {
+                if (message.toolCallId.empty() && next < pending.size())
+                    message.toolCallId = pending[next];
+                ++next;
+            }
+        }
+        return messages;
     }
 
     /// 转换完整消息，保留 Assistant 工具请求和后续 Tool 结果。

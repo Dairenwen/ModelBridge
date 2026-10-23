@@ -1,4 +1,5 @@
 #include "LLMProvider.hpp"
+#include "SessionManager.hpp"
 #include "Util.hpp"
 #include <httplib.h>
 #include <json/json.h>
@@ -7,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 
 namespace modelBridge
@@ -14,44 +16,20 @@ namespace modelBridge
     // 基类：初始化、认证和公共 HTTP 流程
     bool LLMProvider::initialize(const ModelConfig &modelConfig)
     {
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
+        ++historyGeneration;
         configurationValid = false;
         lastError.clear();
         try
         {
             config = modelConfig;
-            if (config.model.protocol != getProtocol() || config.model.modelName.empty())
-                throw std::invalid_argument("Matching protocol and model name are required");
-            const auto scheme = config.baseUrl.find("://");
-            if (scheme == std::string::npos ||
-                (config.baseUrl.substr(0, scheme) != "http" && config.baseUrl.substr(0, scheme) != "https") ||
-                config.baseUrl.find_first_of("?#@\r\n\t ") != std::string::npos)
-                throw std::invalid_argument("baseUrl must be an HTTP(S) service root without credentials or query");
-            while (!config.baseUrl.empty() && config.baseUrl.back() == '/')
-                config.baseUrl.pop_back();
-            if (config.timeoutSeconds <= 0 || (config.maxOutputTokens && *config.maxOutputTokens <= 0))
-                throw std::invalid_argument("Timeout and output token limit must be positive");
-            if (config.temperature && (!std::isfinite(*config.temperature) || *config.temperature < 0))
-                throw std::invalid_argument("Temperature must be finite and non-negative");
-
-            validateReasoning(config);
-
-            if (config.apiKey.empty() && !config.apiKeyEnv.empty())
-            {
-                if (const auto *key = std::getenv(config.apiKeyEnv.c_str()))
-                    config.apiKey = key;
-            }
-
-            if (getProtocol() != ApiProtocol::Ollama && config.apiKey.empty())
-                throw std::invalid_argument("API key is required for this protocol");
-
-            if (config.apiKey.find_first_of("\r\n") != std::string::npos)
-                throw std::invalid_argument("API key contains a newline");
+            validateConfiguration();
 
             configurationValid = true;
 
             MB_LOG_INFO("模型初始化成功：model={}", config.model.modelName);
             resetProtocol();
-            clearHistory(); // 重新初始化成功后开始新对话，保留系统提示词。
+            history.clear(); // 已持有状态锁；初始化成功后开始新对话，保留系统提示词。
             return true;
         }
         catch (const std::exception &error)
@@ -63,52 +41,158 @@ namespace modelBridge
         }
     }
 
+    void LLMProvider::validateConfiguration()
+    {
+        if (config.model.protocol != getProtocol() || config.model.modelName.empty())
+            throw std::invalid_argument("Matching protocol and model name are required");
+        const auto scheme = config.baseUrl.find("://");
+        if (scheme == std::string::npos ||
+            (config.baseUrl.substr(0, scheme) != "http" && config.baseUrl.substr(0, scheme) != "https") ||
+            config.baseUrl.find_first_of("?#@\r\n\t ") != std::string::npos)
+            throw std::invalid_argument("baseUrl must be an HTTP(S) service root without credentials or query");
+        while (!config.baseUrl.empty() && config.baseUrl.back() == '/')
+            config.baseUrl.pop_back();
+        if (config.timeoutSeconds <= 0 || (config.maxOutputTokens && *config.maxOutputTokens <= 0))
+            throw std::invalid_argument("Timeout and output token limit must be positive");
+        if (config.temperature && (!std::isfinite(*config.temperature) || *config.temperature < 0))
+            throw std::invalid_argument("Temperature must be finite and non-negative");
+
+        validateReasoning(config);
+
+        if (config.apiKey.empty() && !config.apiKeyEnv.empty())
+        {
+            if (const auto *key = std::getenv(config.apiKeyEnv.c_str()))
+                config.apiKey = key;
+        }
+
+        if (getProtocol() != ApiProtocol::Ollama && config.apiKey.empty())
+            throw std::invalid_argument("API key is required for this protocol");
+
+        if (config.apiKey.find_first_of("\r\n") != std::string::npos)
+            throw std::invalid_argument("API key contains a newline");
+    }
+
     bool LLMProvider::isInitialized() const
     {
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
         return configurationValid;
     }
 
-    const std::string &LLMProvider::getModelName() const { return config.model.modelName; }
-    const std::string &LLMProvider::getModelDescription() const { return config.model.description; }
-    const ModelInfo &LLMProvider::getModelInfo() const { return config.model; }
-    const std::string &LLMProvider::getLastError() const { return lastError; }
-    const std::string &LLMProvider::getApiKey() const { return config.apiKey; }
+    std::string LLMProvider::getModelName() const
+    {
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
+        return config.model.modelName;
+    }
+
+    std::string LLMProvider::getModelDescription() const
+    {
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
+        return config.model.description;
+    }
+
+    ModelInfo LLMProvider::getModelInfo() const
+    {
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
+        return config.model;
+    }
+
+    std::string LLMProvider::getLastError() const
+    {
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
+        return lastError;
+    }
+
+    std::string LLMProvider::getApiKey() const
+    {
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
+        return config.apiKey;
+    }
 
     void LLMProvider::setApiKey(const std::string &apiKey)
     {
-        if (apiKey.find_first_of("\r\n") != std::string::npos)
-            throw std::invalid_argument("API key contains a newline");
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         config.apiKey = apiKey;
-        MB_LOG_DEBUG("模型认证信息已更新");
     }
 
     void LLMProvider::setSystemPrompt(const std::string &prompt)
     {
-        systemPrompt = prompt;
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
+        if (sessionManager)
+        {
+            if (!sessionManager->setSystemPrompt(sessionId, prompt))
+                throw std::logic_error("Bound session no longer exists");
+        }
+        else
+            systemPrompt = prompt;
     }
 
     void LLMProvider::clearHistory()
     {
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
+        ++historyGeneration;
+        if (sessionManager)
+            sessionManager->clearMessages(sessionId);
         history.clear();
     }
 
-    const std::vector<Message> &LLMProvider::getHistory() const
+    std::vector<Message> LLMProvider::getHistory() const
     {
-        return history;
+        std::shared_lock<std::shared_mutex> lock(stateMutex);
+        auto messages = sessionManager ? sessionManager->getMessages(sessionId).value_or(std::vector<Message>{}) : history;
+        messages.erase(std::remove_if(messages.begin(), messages.end(),
+            [](const Message &message) { return message.role == MessageRole::System; }), messages.end());
+        return messages;
     }
 
-    std::vector<Message> LLMProvider::buildMessages(const std::string &message) const
+    std::vector<Message> LLMProvider::buildMessages(const std::string &message, RequestContext &context) const
     {
-        // 在副本上构造本轮消息，请求失败不会留下尚未完成的用户消息。
-        auto messages = history;
-        if (!systemPrompt.empty())
-            messages.insert(messages.begin(), Message{MessageRole::System, systemPrompt, currentTimeMillis(), {}, {}});
-        messages.push_back({MessageRole::User, message, currentTimeMillis(), {}, {}});
+        std::vector<Message> messages;
+        std::string prompt;
+        {
+            std::shared_lock<std::shared_mutex> lock(stateMutex);
+            context.config = config;
+            context.tools = tools;
+            context.initialized = configurationValid;
+            context.historyGeneration = historyGeneration;
+            captureProtocol(context);
+            context.sessionManager = sessionManager;
+            context.sessionId = sessionId;
+            if (sessionManager)
+            {
+                auto session = sessionManager->getSession(sessionId);
+                if (!session)
+                    throw std::logic_error("Bound session no longer exists");
+                messages = std::move(session->messages);
+                context.sessionGeneration = session->generation;
+            }
+            else
+            {
+                messages = history;
+                prompt = systemPrompt;
+            }
+        }
+        // 在锁外构造本轮消息，请求失败不会留下尚未完成的用户消息。
+        if (!prompt.empty())
+            messages.insert(messages.begin(), Message{{}, MessageRole::System, prompt, currentTimeMillis(), {}, {}});
+        messages.push_back({{}, MessageRole::User, message, currentTimeMillis(), {}, {}});
         return messages;
+    }
+
+    bool LLMProvider::bindSession(std::shared_ptr<SessionManager> manager, const std::string &id)
+    {
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
+        if (manager && !manager->getSession(id))
+            return false;
+        sessionId = manager ? id : std::string{};
+        sessionManager = std::move(manager);
+        ++historyGeneration;
+        history.clear();
+        return true;
     }
 
     void LLMProvider::setTools(const std::vector<Tool> &value)
     {
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
         tools = value;
     }
 
@@ -126,59 +210,84 @@ namespace modelBridge
         return result;
     }
 
-    void LLMProvider::saveHistory(const std::vector<Message> &messages)
+    void LLMProvider::saveHistory(const std::vector<Message> &messages, const RequestContext &context)
     {
-        auto begin = messages.begin();
-        if (begin != messages.end() && begin->role == MessageRole::System) // 不保存系统消息
-            ++begin;
-        std::vector<Message> saved(begin, messages.end());
-        history.swap(saved);
+        std::unique_lock<std::shared_mutex> lock(stateMutex);
+        // 已绑定的请求始终写回原会话；管理器负责拒绝清空或删除后的旧结果。
+        if (context.sessionManager)
+            context.sessionManager->addMessages(context.sessionId, messages, context.config, context.sessionGeneration);
+        else if (context.historyGeneration == historyGeneration)
+            history.insert(history.end(), messages.begin(), messages.end());
     }
 
     ChatResult LLMProvider::performRequest(const std::string &message, bool stream, const StreamCallback &callback)
     {
-        auto messages = buildMessages(message);
+        RequestContext context;
+        auto messages = buildMessages(message, context);
+        // 所有新增消息使用同一请求配置，结果交给管理器后不再重标记。
+        const auto stamp = [&](Message &entry)
+        {
+            entry.messageId = SessionManager::generateMessageId();
+            entry.modelConfigId = context.config.configId;
+            entry.modelName = context.config.model.modelName;
+            entry.reasoningEffort = context.config.reasoningEffort;
+            entry.thinkingEnabled = context.config.thinkingEnabled;
+        };
+        stamp(messages.back());
         ChatResult result;
         result.messages.push_back(messages.back());
-        for (;;)
+        try
         {
-            auto reply = requestOnce(messages, stream, callback);
-            messages.push_back(reply);
-            result.messages.push_back(reply);
-            result.content += reply.content;
-            saveHistory(messages);
-            if (reply.toolCalls.empty())
-                return result;
-
-            // 每轮先执行全部工具，再将全部结果一起交回模型。
-            for (const auto &call : reply.toolCalls)
+            for (;;)
             {
-                Message output{MessageRole::Tool, {}, currentTimeMillis(), call.id, call.name};
-                const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool &entry)
-                                               { return entry.name == call.name; });
-                try
+                auto reply = requestOnce(messages, stream, callback, context);
+                stamp(reply);
+                messages.push_back(reply);
+                result.messages.push_back(reply);
+                result.content += reply.content;
+                if (reply.toolCalls.empty())
+                    break;
+
+                // 工具使用本轮快照，在状态锁之外执行；其他请求不必等待该工具。
+                for (const auto &call : reply.toolCalls)
                 {
-                    if (tool == tools.end() || !tool->execute)
-                        output.content = "{\"error\":\"Tool is not registered\"}";
-                    else
-                        output.content = tool->execute(call.arguments);
+                    Message output{{}, MessageRole::Tool, {}, currentTimeMillis(), call.id, call.name};
+                    const auto tool = std::find_if(context.tools.begin(), context.tools.end(), [&](const Tool &entry)
+                                                   { return entry.name == call.name; });
+                    try
+                    {
+                        if (tool == context.tools.end() || !tool->execute)
+                            output.content = "{\"error\":\"Tool is not registered\"}";
+                        else
+                            output.content = tool->execute(call.arguments);
+                    }
+                    catch (const std::exception &error)
+                    {
+                        Json::Value failure;
+                        failure["error"] = error.what();
+                        output.content = compactJson(failure);
+                    }
+                    stamp(output);
+                    messages.push_back(output);
+                    result.messages.push_back(output);
                 }
-                catch (const std::exception &error)
-                {
-                    Json::Value failure;
-                    failure["error"] = error.what();
-                    output.content = compactJson(failure);
-                }
-                messages.push_back(output);
-                result.messages.push_back(output);
-                // 已执行的工具不因后续 HTTP 失败而从历史消失，避免重试时重复执行
-                saveHistory(messages);
             }
         }
+        catch (...)
+        {
+            // 后续请求失败也保留已完成的步骤；首个请求失败时不保存孤立的 User 消息。
+            if (result.messages.size() > 1)
+                saveHistory(result.messages, context);
+            throw;
+        }
+        // 整条消息链一次追加，避免并发请求覆盖历史或交错各自的工具结果。
+        saveHistory(result.messages, context);
+        return result;
     }
 
-    Message LLMProvider::requestOnce(const std::vector<Message> &messages, bool stream, const StreamCallback &callback)
+    Message LLMProvider::requestOnce(const std::vector<Message> &messages, bool stream, const StreamCallback &callback, RequestContext &context)
     {
+        const auto &config = context.config;
         const auto started = std::chrono::steady_clock::now();
         const char *stage = "检查配置";
         std::string errorBody;
@@ -186,7 +295,7 @@ namespace modelBridge
         httplib::Error transportError = httplib::Error::Success;
         try
         {
-            if (!isInitialized())
+            if (!context.initialized)
                 throw std::logic_error("Provider is not initialized");
             if (messages.empty())
                 throw std::invalid_argument("Messages must not be empty");
@@ -206,7 +315,7 @@ namespace modelBridge
 
             httplib::Request request;
             request.method = "POST";
-            request.path = prefix + makeRequestPath(stream);
+            request.path = prefix + makeRequestPath(stream, context);
             request.headers.emplace("Content-Type", "application/json");
             request.headers.emplace("Accept", stream && protocol != ApiProtocol::Ollama ? "text/event-stream" : "application/json");
             if (!config.apiKey.empty())
@@ -216,13 +325,13 @@ namespace modelBridge
             }
             Json::StreamWriterBuilder writer;
             writer["indentation"] = ""; // 不对 JSON 进行格式化缩进，减少不必要的请求体字节
-            request.body = Json::writeString(writer, makeRequestBody(messages, stream));
+            request.body = Json::writeString(writer, makeRequestBody(messages, stream, context));
             MB_LOG_DEBUG("模型请求体已构造：字节数={}", request.body.size());
 
             // 2. 流式事件只回调文本增量；外层保存历史后再发出完成通知。
             bool finished = false;
             bool receivedDone = false;
-            Message result{MessageRole::Assistant, {}, currentTimeMillis(), {}, {}};
+            Message result{{}, MessageRole::Assistant, {}, currentTimeMillis(), {}, {}};
             StreamDecoder decoder;
             decoder.ndjson = protocol == ApiProtocol::Ollama;
             if (stream)
@@ -241,7 +350,7 @@ namespace modelBridge
                     if (receivedDone)
                         throw std::runtime_error("Data received after stream completion");
 
-                    const auto delta = readResponse(parseJson(event), true, result, finished);
+                    const auto delta = readResponse(parseJson(event), true, result, finished, context);
                     result.content += delta;
 
                     if (!delta.empty())
@@ -282,8 +391,15 @@ namespace modelBridge
                 std::string diagnostics;
                 // 只在 HTTP 明确拒绝当前协议时回退；传输失败、鉴权和限流不重发。
                 if ((status == 400 || status == 404 || status == 405) &&
-                    Json::parseFromStream(reader, input, &error, &diagnostics) && tryProtocolFallback(error))
-                    return requestOnce(messages, stream, callback);
+                    Json::parseFromStream(reader, input, &error, &diagnostics) && tryProtocolFallback(error, context))
+                {
+                    {
+                        std::unique_lock<std::shared_mutex> lock(stateMutex);
+                        if (context.historyGeneration == historyGeneration)
+                            rememberProtocol(context);
+                    }
+                    return requestOnce(messages, stream, callback, context);
+                }
                 throw std::runtime_error("Model HTTP status " + std::to_string(status) + ": " + body);
             }
 
@@ -292,13 +408,13 @@ namespace modelBridge
             if (stream)
             {
                 decoder.finish(); // 处理缓冲区尚未解析的数据
-                if (!finished || (requiresDoneMarker() && !receivedDone))
+                if (!finished || (requiresDoneMarker(context) && !receivedDone))
                 {
                     throw std::runtime_error("Model stream ended without complete termination information");
                 }
             }
             else
-                result.content = readResponse(parseJson(response->body), false, result, finished);
+                result.content = readResponse(parseJson(response->body), false, result, finished, context);
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
             MB_LOG_INFO("模型请求完成：model={}，HTTP={}，回复字节数={}，耗时={}ms", config.model.modelName, status, result.content.size(), elapsed);
             return result;
@@ -313,14 +429,34 @@ namespace modelBridge
     // OpenAI 兼容协议：OpenAI、DeepSeek、百炼
     ApiProtocol OpenAICompatibleProvider::getProtocol() const { return ApiProtocol::OpenAICompatible; }
 
-    std::string OpenAICompatibleProvider::makeRequestPath(bool) const
+    void OpenAICompatibleProvider::captureProtocol(RequestContext &context) const
     {
-        return responses ? "/responses" : "/chat/completions";
+        context.responses = responses;
     }
 
-    bool OpenAICompatibleProvider::tryProtocolFallback(const Json::Value &error)
+    void OpenAICompatibleProvider::rememberProtocol(const RequestContext &context)
     {
-        if (responses || !error.isObject() || !error["error"].isObject())
+        responses = context.responses;
+    }
+
+    void OpenAICompatibleProvider::resetProtocol()
+    {
+        responses = false;
+    }
+
+    bool OpenAICompatibleProvider::requiresDoneMarker(const RequestContext &context) const
+    {
+        return !context.responses;
+    }
+
+    std::string OpenAICompatibleProvider::makeRequestPath(bool, const RequestContext &context) const
+    {
+        return context.responses ? "/responses" : "/chat/completions";
+    }
+
+    bool OpenAICompatibleProvider::tryProtocolFallback(const Json::Value &error, RequestContext &context)
+    {
+        if (context.responses || !error.isObject() || !error["error"].isObject())
             return false;
 
         const auto &codeValue = error["error"]["code"];
@@ -333,13 +469,17 @@ namespace modelBridge
             return false;
         }
 
-        responses = true;
+        context.responses = true;
         MB_LOG_INFO("当前渠道不支持 Chat Completions，改用 Responses");
         return true;
     }
 
-    Json::Value OpenAICompatibleProvider::makeRequestBody(const std::vector<Message> &messages, bool stream) const
+    Json::Value OpenAICompatibleProvider::makeRequestBody(const std::vector<Message> &historyMessages, bool stream, const RequestContext &context) const
     {
+        const auto &config = context.config;
+        const auto &tools = context.tools;
+        const bool responses = context.responses;
+        const auto messages = withToolCallIds(historyMessages);
         Json::Value body;
         body["model"] = config.model.modelName;
         body["stream"] = stream;
@@ -369,12 +509,17 @@ namespace modelBridge
         body["input"] = Json::Value(Json::arrayValue);
         for (const auto &message : messages)
         {
-            if (message.role == MessageRole::Assistant && !message.protocolData.empty())
+            if (message.role == MessageRole::Assistant && !message.protocolData.empty() &&
+                (message.modelName.empty() || message.modelName == config.model.modelName) &&
+                (message.modelConfigId.empty() || message.modelConfigId == config.configId))
             {
                 const auto native = parseJson(message.protocolData, false);
-                for (const auto &item : native["output"])
-                    body["input"].append(item);
-                continue;
+                if (native["output"].isArray() && !native["output"].empty())
+                {
+                    for (const auto &item : native["output"])
+                        body["input"].append(item);
+                    continue;
+                }
             }
             Json::Value item;
             if (message.role == MessageRole::Tool)
@@ -426,9 +571,10 @@ namespace modelBridge
         return body;
     }
 
-    std::string OpenAICompatibleProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const
+    std::string OpenAICompatibleProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished, const RequestContext &context) const
     {
-        if (responses)
+        const auto &config = context.config;
+        if (context.responses)
         {
             const auto type = payload.get("type", "").asString();
             if (stream && type == "response.output_text.delta")
@@ -480,9 +626,9 @@ namespace modelBridge
     ApiProtocol GeminiProvider::getProtocol() const { return ApiProtocol::Gemini; }
 
     /// 模型名放入 URL；流式使用 streamGenerateContent 和 SSE。
-    std::string GeminiProvider::makeRequestPath(bool stream) const
+    std::string GeminiProvider::makeRequestPath(bool stream, const RequestContext &context) const
     {
-        auto model = config.model.modelName;
+        auto model = context.config.model.modelName;
         if (model.compare(0, 7, "models/") == 0)
             model.erase(0, 7);
         if (model.empty())
@@ -492,8 +638,10 @@ namespace modelBridge
     }
 
     /// System 放入 systemInstruction，Assistant 转为 model，其余文本放入 parts。
-    Json::Value GeminiProvider::makeRequestBody(const std::vector<Message> &messages, bool) const
+    Json::Value GeminiProvider::makeRequestBody(const std::vector<Message> &messages, bool, const RequestContext &context) const
     {
+        const auto &config = context.config;
+        const auto &tools = context.tools;
         Json::Value body;
         auto &contents = body["contents"];
         contents = Json::Value(Json::arrayValue);
@@ -516,24 +664,33 @@ namespace modelBridge
                     part["functionResponse"]["id"] = message.toolCallId;
                 parts.append(part);
             }
-            else if (message.role == MessageRole::Assistant && !message.protocolData.empty())
-                parts = parseJson(message.protocolData, false)["parts"];
             else
             {
-                if (!message.content.empty())
+                if (message.role == MessageRole::Assistant && !message.protocolData.empty() &&
+                    (message.modelName.empty() || message.modelName == config.model.modelName) &&
+                    (message.modelConfigId.empty() || message.modelConfigId == config.configId))
                 {
-                    Json::Value part;
-                    part["text"] = message.content;
-                    parts.append(part);
+                    const auto native = parseJson(message.protocolData, false);
+                    if (native["parts"].isArray())
+                        parts = native["parts"];
                 }
-                for (const auto &call : message.toolCalls)
+                if (parts.empty())
                 {
-                    Json::Value part;
-                    part["functionCall"]["name"] = call.name;
-                    part["functionCall"]["args"] = parseJson(call.arguments, false);
-                    if (!call.id.empty())
-                        part["functionCall"]["id"] = call.id;
-                    parts.append(part);
+                    if (!message.content.empty())
+                    {
+                        Json::Value part;
+                        part["text"] = message.content;
+                        parts.append(part);
+                    }
+                    for (const auto &call : message.toolCalls)
+                    {
+                        Json::Value part;
+                        part["functionCall"]["name"] = call.name;
+                        part["functionCall"]["args"] = parseJson(call.arguments, false);
+                        if (!call.id.empty())
+                            part["functionCall"]["id"] = call.id;
+                        parts.append(part);
+                    }
                 }
             }
             const auto role = message.role == MessageRole::Assistant ? "model" : "user";
@@ -575,8 +732,9 @@ namespace modelBridge
     }
 
     /// 按顺序拼接首个候选的可见 parts，以 finishReason 判断流结束。
-    std::string GeminiProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const
+    std::string GeminiProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished, const RequestContext &context) const
     {
+        const auto &config = context.config;
         if (payload["promptFeedback"].isMember("blockReason"))
             throw std::runtime_error("Gemini blocked the prompt");
         const auto &candidates = payload["candidates"];
@@ -618,15 +776,18 @@ namespace modelBridge
     ApiProtocol OllamaProvider::getProtocol() const { return ApiProtocol::Ollama; }
 
     /// 兼容 baseUrl 已带 /api 的写法，避免重复拼接。
-    std::string OllamaProvider::makeRequestPath(bool) const
+    std::string OllamaProvider::makeRequestPath(bool, const RequestContext &context) const
     {
+        const auto &config = context.config;
         const bool hasApi = config.baseUrl.size() >= 4 && config.baseUrl.compare(config.baseUrl.size() - 4, 4, "/api") == 0;
         return hasApi ? "/chat" : "/api/chat";
     }
 
     /// 采样参数放入 options；think 在顶层，支持字符串级别或布尔开关。
-    Json::Value OllamaProvider::makeRequestBody(const std::vector<Message> &messages, bool stream) const
+    Json::Value OllamaProvider::makeRequestBody(const std::vector<Message> &messages, bool stream, const RequestContext &context) const
     {
+        const auto &config = context.config;
+        const auto &tools = context.tools;
         Json::Value body;
         body["model"] = config.model.modelName;
         body["messages"] = makeChatMessages(messages, getProtocol());
@@ -645,8 +806,9 @@ namespace modelBridge
     }
 
     /// 普通 JSON 和每条 NDJSON 使用同一结构；最终记录可同时带文本和 done=true。
-    std::string OllamaProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished) const
+    std::string OllamaProvider::readResponse(const Json::Value &payload, bool stream, Message &reply, bool &finished, const RequestContext &context) const
     {
+        const auto &config = context.config;
         const auto &message = payload["message"];
         if (!payload["done"].isBool() || !message.isObject())
             throw std::runtime_error("Invalid Ollama response");

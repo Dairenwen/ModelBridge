@@ -1,9 +1,8 @@
-
 **系统身份**: 你是一个资深C++后端开发工程师
 
-**任务**: 在SessionManager.hpp中实现会话管理类，使会话管理更加方便，并与LLMProvider.hpp顺利融合；
+**任务**: 在`SessionManager.hpp`和`SessionManager.cpp`中实现会话管理类，使会话管理更加方便，并与LLMProvider.hpp顺利融合；
 
-**技术要求**
+**技术要求·=**
 
 - 代码逻辑清晰，结构合理
 - 注释完整:

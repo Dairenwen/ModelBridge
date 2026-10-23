@@ -1060,9 +1060,9 @@ choices[0].message.content
 - OpenAI 兼容接口使用 `temperature`、`max_tokens` 等兼容参数。
 - 兼容接口并不代表支持 OpenAI API 的全部功能。
 
-## 8. LLMProvider 封装的三种聊天协议
+## 8. LLMProvider 封装
 
-本节对应 `SDK/include/LLMProvider.hpp` 和 `SDK/src/LLMProvider.cpp` 的当前实现。
+对应 `SDK/include/LLMProvider.hpp`、`SDK/src/LLMProvider.cpp` 和 `SessionManager` 的当前实现。
 三种协议均通过 HTTP `POST` 发送 JSON，但请求路径、认证头、消息结构和流式格式不同。
 `baseUrl` 是服务根地址，`requestUrl` 是最终请求地址：
 
@@ -1070,25 +1070,24 @@ choices[0].message.content
 requestUrl = baseUrl（去掉末尾 /）+ Provider 生成的路径
 ```
 
+`sendMessage` 和 `sendMessageStream` 均返回 `ChatResult`：`content` 为本轮可见文本，`messages` 为本轮新增的 User / Assistant / Tool 消息链。Provider 自动携带历史、执行通过 `setTools` 注册的工具，并保存完整消息链；未绑定会话时使用 Provider 的本地历史；调用 `bindSession` 绑定已有会话后，改由 `SessionManager` 读取和保存该会话的历史。
+
 ### 8.1 baseUrl 与请求 URL
 
-| 协议 / 服务                | baseUrl 示例                                          | 普通请求路径                        | 流式请求路径                                      |
-| -------------------------- | ----------------------------------------------------- | ----------------------------------- | ------------------------------------------------- |
-| OpenAI 兼容 / OpenAI       | `https://api.openai.com/v1`                         | `/chat/completions`               | `/chat/completions`                             |
-| OpenAI 兼容 / DeepSeek     | `https://api.deepseek.com`                          | `/chat/completions`               | `/chat/completions`                             |
-| OpenAI 兼容 / 百炼北京区域 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `/chat/completions`               | `/chat/completions`                             |
-| Gemini 原生                | `https://generativelanguage.googleapis.com/v1beta`  | `/models/{model}:generateContent` | `/models/{model}:streamGenerateContent?alt=sse` |
-| Ollama 原生                | `http://127.0.0.1:11434`                            | `/api/chat`                       | `/api/chat`                                     |
-
-例如，OpenAI 的完整地址是 `https://api.openai.com/v1/chat/completions`，
-DeepSeek 是 `https://api.deepseek.com/chat/completions`。
-百炼不同区域有不同地址，需要与 API Key 所属区域匹配。Ollama 的 `baseUrl` 若已包含末尾 `/api`，当前实现只追加 `/chat`，避免重复拼接。
+| 协议 / 服务                  | baseUrl 示例                                          | 普通请求路径                        | 流式请求路径                                      |
+| ---------------------------- | ----------------------------------------------------- | ----------------------------------- | ------------------------------------------------- |
+| OpenAI 兼容 / OpenAI         | `https://api.openai.com/v1`                         | `/chat/completions`               | `/chat/completions`                             |
+| OpenAI 兼容 / DeepSeek       | `https://api.deepseek.com`                          | `/chat/completions`               | `/chat/completions`                             |
+| OpenAI 兼容 / 百炼北京区域   | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `/chat/completions`               | `/chat/completions`                             |
+| OpenAI 兼容 / Responses 回退 | 与当前兼容服务相同                                    | `/responses`                      | `/responses`                                    |
+| Gemini 原生                  | `https://generativelanguage.googleapis.com/v1beta`  | `/models/{model}:generateContent` | `/models/{model}:streamGenerateContent?alt=sse` |
+| Ollama 原生                  | `http://127.0.0.1:11434`                            | `/api/chat`                       | `/api/chat`                                     |
 
 依据：[OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat)、[DeepSeek 接入说明](https://api-docs.deepseek.com/)、[百炼 OpenAI 兼容接口](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope)。
 
 **推理深度配置**
 
-在 `ModelConfig` 的生成参数处保留两个可选字段；未设置时不发送对应参数，使用服务端默认值：
+在 `ModelConfig` 的生成参数处保留两个可选字段；未设置时不发送对应参数，使用服务端默认值。下表中的兼容协议映射以 Chat Completions 为例：
 
 | 配置字段            | 类型                           | 含义                                             |
 | ------------------- | ------------------------------ | ------------------------------------------------ |
@@ -1107,6 +1106,7 @@ DeepSeek 是 `https://api.deepseek.com/chat/completions`。
 
 ```cpp
 modelBridge::ModelConfig config{};
+config.configId = "default-model";
 config.model.protocol = modelBridge::ApiProtocol::OpenAICompatible;
 config.model.provider = modelBridge::ProviderType::OpenAI;
 config.model.modelName = "your-reasoning-model-id"; // 替换为实际支持推理的模型。
@@ -1121,9 +1121,25 @@ if (!provider.initialize(config))
     throw std::runtime_error(provider.getLastError());
 ```
 
+需要按会话 ID 续聊时，先创建会话，再绑定到已初始化的 Provider：
+
+```cpp
+#include "SessionManager.hpp"
+#include <memory>
+
+auto sessions = std::make_shared<modelBridge::SessionManager>();
+auto sessionId = sessions->createSession("user-1", config.configId, "新会话", "你是一名 C++ 开发工程师。");
+if (!provider.bindSession(sessions, sessionId))
+    throw std::runtime_error("会话不存在");
+auto result = provider.sendMessage("解释 Reactor 模型。");
+auto messages = sessions->getMessages(sessionId); // 包含系统消息、工具调用及结果。
+```
+
+新 Provider 仍需初始化，需要执行工具时另行调用 `setTools` 注册。同一 Provider 可并发发送，每轮使用开始时的配置、工具和历史快照，整条消息链按提交顺序保存；依赖上一轮回复时须等待其完成。切换模型或会话后，在途请求仍保存到原绑定会话，原会话被清空或删除后不再写回。未绑定时，重新初始化会清空本地历史。
+
 ### 8.2 OpenAI 兼容协议
 
-对应 `OpenAICompatibleProvider` 和 `ApiProtocol::OpenAICompatible`。OpenAI、DeepSeek、百炼以及兼容此协议的中转服务可以共用该实现。
+OpenAI、DeepSeek、百炼以及兼容此协议的中转服务可以共用该实现。默认使用 Chat Completions；仅在 HTTP 400 / 404 / 405 且错误码为 `protocol_not_supported`、`unsupported_protocol` 或 `unsupported_endpoint` 时，回退到 `/responses`，以下表格和示例以 Chat Completions 为主。
 
 **请求头**
 
@@ -1136,20 +1152,23 @@ if (!provider.initialize(config))
 
 **请求体参数**
 
-| 参数                        | 是否必填          | 当前封装的含义                                                         |
-| --------------------------- | ----------------- | ---------------------------------------------------------------------- |
-| `model`                   | 是                | `ModelInfo::modelName`，请求使用的模型 ID                            |
-| `messages`                | 是                | 按顺序保存的完整上下文，不能为空                                       |
-| `messages[].role`         | 是                | `system`、`user`、`assistant`；工具结果使用 `tool`             |
-| `messages[].content`      | 是                | 文本内容                                                               |
-| `messages[].tool_call_id` | Tool 消息需要     | 对应 `Message::toolCallId`，关联原工具调用                           |
-| `stream`                  | Provider 总是发送 | `sendMessage` 为 `false`，`sendMessageStream` 为 `true`        |
-| `temperature`             | 否                | 配置了 `temperature` 才发送，包括显式的 `0`                        |
-| `max_completion_tokens`   | 否                | `provider == ProviderType::OpenAI` 时使用的输出上限字段              |
-| `max_tokens`              | 否                | 当前封装对其他兼容平台使用的输出上限字段                               |
-| `reasoning_effort`        | 否                | `reasoningEffort`；可用级别以具体模型为准                            |
-| `thinking.type`           | 否                | DeepSeek 的 `thinkingEnabled` 映射，值为 `enabled` 或 `disabled` |
-| `enable_thinking`         | 否                | 百炼的 `thinkingEnabled` 映射，布尔值                                |
+| 参数                             | 是否必填             | 当前封装的含义                                                         |
+| -------------------------------- | -------------------- | ---------------------------------------------------------------------- |
+| `model`                        | 是                   | `ModelInfo::modelName`，请求使用的模型 ID                            |
+| `messages`                     | 是                   | 按顺序保存的完整上下文，不能为空                                       |
+| `messages[].role`              | 是                   | `system`、`user`、`assistant`；工具结果使用 `tool`             |
+| `messages[].content`           | 是                   | 文本内容                                                               |
+| `tools`                        | 注册工具时发送       | 工具名称、说明和参数 JSON Schema，由 `setTools` 注册                 |
+| `messages[].tool_calls`        | Assistant 调用工具时 | 调用 ID、工具名称及参数，对应 `Message::toolCalls`                   |
+| `messages[].reasoning_content` | 有思考内容时         | 对应 `Message::reasoningContent`                                     |
+| `messages[].tool_call_id`      | Tool 消息需要        | 对应 `Message::toolCallId`，关联原工具调用                           |
+| `stream`                       | Provider 总是发送    | `sendMessage` 为 `false`，`sendMessageStream` 为 `true`        |
+| `temperature`                  | 否                   | 配置了 `temperature` 才发送，包括显式的 `0`                        |
+| `max_completion_tokens`        | 否                   | `provider == ProviderType::OpenAI` 时使用的输出上限字段              |
+| `max_tokens`                   | 否                   | 当前封装对其他兼容平台使用的输出上限字段                               |
+| `reasoning_effort`             | 否                   | `reasoningEffort`；可用级别以具体模型为准                            |
+| `thinking.type`                | 否                   | DeepSeek 的 `thinkingEnabled` 映射，值为 `enabled` 或 `disabled` |
+| `enable_thinking`              | 否                   | 百炼的 `thinkingEnabled` 映射，布尔值                                |
 
 两种 Token 上限字段只发送一种；部分模型不支持温度等采样参数，可保持未设置。
 以下为 DeepSeek 等传统兼容接口的示例请求体：
@@ -1184,12 +1203,14 @@ if (!provider.initialize(config))
 }
 ```
 
-| 响应参数                       | 含义                                                        | 当前 SDK 的处理                              |
-| ------------------------------ | ----------------------------------------------------------- | -------------------------------------------- |
-| `choices[0].message.content` | 第一个候选回答的文本                                        | 作为返回字符串                               |
-| `choices[].finish_reason`    | 如 `stop`、`length`、`tool_calls`、`content_filter` | 长度截断保留已有文本；工具调用或内容拦截报错 |
-| `usage`                      | 输入、输出及总 Token 统计                                   | 当前文本接口不返回统计                       |
-| `id`、`model`              | 服务端响应 ID、实际模型                                     | 不作为回复文本返回                           |
+| 响应参数                                 | 含义                                                        | 当前 SDK 的处理                                           |
+| ---------------------------------------- | ----------------------------------------------------------- | --------------------------------------------------------- |
+| `choices[0].message.content`           | 第一个候选回答的文本                                        | 汇总到 `ChatResult::content`，并保存在 Assistant 消息中 |
+| `choices[0].message.tool_calls`        | 模型请求的工具调用                                          | 保存到 `Message::toolCalls`，执行工具后继续请求         |
+| `choices[0].message.reasoning_content` | 模型返回的思考内容                                          | 保存到 `Message::reasoningContent`，不混入可见文本      |
+| `choices[].finish_reason`              | 如 `stop`、`length`、`tool_calls`、`content_filter` | 文本长度截断保留已有内容；工具调用被截断或内容拦截时报错  |
+| `usage`                                | 输入、输出及总 Token 统计                                   | 当前文本接口不返回统计                                    |
+| `id`、`model`                        | 服务端响应 ID、实际模型                                     | 不作为回复文本返回                                        |
 
 **流式响应：SSE**
 
@@ -1205,17 +1226,19 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 data: [DONE]
 ```
 
-可见文本位于 `choices[0].delta.content`，按增量拼接。角色事件或用量事件可以没有文本，不能因此判断响应结束。当前封装以 `[DONE]` 判断 OpenAI 兼容流已完整结束。
+可见文本位于 `choices[0].delta.content`，按增量拼接。角色事件或用量事件可以没有文本，不能因此判断响应结束。当前 Chat Completions 流要求收到可接受的 `finish_reason` 和 `[DONE]`，并正常完成 HTTP 传输。
+
+回退到 Responses 后，历史改放在 `input` 中，输出上限使用 `max_output_tokens`，推理级别使用 `reasoning.effort`；工具调用和结果分别转换为 `function_call`、`function_call_output`。请求设置 `store: false` 并请求 `reasoning.encrypted_content`，原生 `output` 保存在 `Message::protocolData` 中供后续回放。流式读取 `response.output_text.delta`，以最终响应状态判断完成，不依赖 `[DONE]`。
 
 **推理与历史会话注意事项**
 
 - OpenAI 的推理级别取决于模型，例如 `low`、`medium`、`high`；不能认为所有模型均支持 `none`、`minimal`、`xhigh` 或 `max`。
 - DeepSeek 当前接口支持 `reasoning_effort`（如 `none`、`low`、`high`、`max`）和 `thinking.type`。可只设置一个；同时设置时必须一致，例如 `thinkingEnabled = false` 不能与 `reasoningEffort = "high"` 同用。旧版模型或兼容实现可能只支持其中部分参数。
-- 百炼使用 `thinkingEnabled = true` 开启思考；部分模型另支持 `reasoning_effort`，不能把它当作所有百炼模型的通用参数。显式关闭思考时，本封装拒绝再设置非 `none` 的级别。部分思考模型只支持流式调用，应使用 `sendMessageStream`。
-- 本封装调用的 Chat Completions 需要客户端每次发送所需的完整 `messages`；**SDK 不会在 Provider 内保存历史，也不会自动追加回复。**
-- 保持系统设定时，每轮都要携带 `System` 消息；历史回复使用 `Assistant`，新问题使用 `User`，按发生顺序排列。**只发送新问题不会自动获得前文，服务端的缓存也不替代本封装的历史传递。**
-- 成功后，将返回的完整文本作为一条 `Assistant` 消息保存，再追加下一条 `User`；流式增量只用于展示，最终回复只保存一次。
-- 当前 `Message` 只保存文本及 `toolCallId`，不保存 `reasoning_content` 和完整工具调用信息。普通文本历史保存最终回答即可；需要回传思考内容的工具调用流程不在当前接口范围内。仅存在 `Tool` 角色不代表已经支持完整工具会话。
+- 百炼使用 `thinkingEnabled = true` 开启思考；部分模型另支持 `reasoning_effort`，不能把它当作所有百炼模型的通用参数。显式关闭思考时，应避免同时设置非 `none` 的级别。部分思考模型只支持流式调用，应使用 `sendMessageStream`。
+- Chat Completions 每次需要完整 `messages`；Provider 会自动携带本地或绑定会话的历史，无需调用方重建上下文。
+- 未绑定时，`setSystemPrompt` 设置每轮使用的系统提示；绑定后使用会话中的 System 消息，`setSystemPrompt` 同步更新会话。服务端缓存不替代 SDK 的历史管理。
+- 成功后，SDK 自动保存本轮 User / Assistant / Tool 消息链；流式增量只用于展示。后续请求失败时保留已完成的工具步骤，首个请求失败时不保存孤立的 User 消息。
+- `getMessages(sessionId)` 返回完整历史，可查询工具名称、参数、执行结果、思考内容及消息中记录的模型和思考配置；工具执行函数需由调用方注册。已有消息 ID 用于保存去重，不要只保存 `ChatResult::content` 来恢复工具会话。
 
 依据：[OpenAI 推理参数](https://developers.openai.com/api/docs/guides/reasoning?api-mode=chat)、[DeepSeek 请求参数](https://api-docs.deepseek.com/api/create-chat-completion/)、[百炼深度思考](https://help.aliyun.com/zh/model-studio/deep-thinking)、[DeepSeek 多轮对话](https://api-docs.deepseek.com/guides/multi_round_chat/)、[OpenAI 会话状态](https://developers.openai.com/api/docs/guides/conversation-state)。
 
@@ -1240,15 +1263,18 @@ data: [DONE]
 
 **请求体参数**
 
-| 参数                                              | 是否必填     | 当前封装的含义                                              |
-| ------------------------------------------------- | ------------ | ----------------------------------------------------------- |
-| `contents`                                      | 是           | 用户及模型的对话历史，至少包含一条非 System 消息            |
-| `contents[].role`                               | 当前封装发送 | User 映射为 `user`，Assistant 映射为 `model`            |
-| `contents[].parts[].text`                       | 文本请求需要 | 一条消息的文本内容                                          |
-| `systemInstruction.parts[].text`                | 否           | System 消息放在这里，不放入 `contents`                    |
-| `generationConfig.temperature`                  | 否           | 采样温度                                                    |
-| `generationConfig.maxOutputTokens`              | 否           | 输出 Token 上限                                             |
-| `generationConfig.thinkingConfig.thinkingLevel` | 否           | `reasoningEffort` 转为大写后发送，如 `high` → `HIGH` |
+| 参数                                              | 是否必填             | 当前封装的含义                                              |
+| ------------------------------------------------- | -------------------- | ----------------------------------------------------------- |
+| `contents`                                      | 是                   | 用户及模型的对话历史，至少包含一条非 System 消息            |
+| `contents[].role`                               | 当前封装发送         | User 映射为 `user`，Assistant 映射为 `model`            |
+| `contents[].parts[].text`                       | 文本请求需要         | 一条消息的文本内容                                          |
+| `tools[].functionDeclarations`                  | 注册工具时发送       | 工具名称、说明和参数 JSON Schema                            |
+| `contents[].parts[].functionCall`               | Assistant 调用工具时 | 工具调用名称、参数及可选 ID                                 |
+| `contents[].parts[].functionResponse`           | Tool 消息需要        | 工具执行结果，消息角色为 `user`                           |
+| `systemInstruction.parts[].text`                | 否                   | System 消息放在这里，不放入 `contents`                    |
+| `generationConfig.temperature`                  | 否                   | 采样温度                                                    |
+| `generationConfig.maxOutputTokens`              | 否                   | 输出 Token 上限                                             |
+| `generationConfig.thinkingConfig.thinkingLevel` | 否                   | `reasoningEffort` 转为大写后发送，如 `high` → `HIGH` |
 
 Gemini 的模型名位于 URL 中，原生请求体不添加 OpenAI 风格的 `model`、`messages` 或 `stream`。
 连续同角色消息在当前实现中合并为同一条内容的多个 parts。
@@ -1283,12 +1309,12 @@ Gemini 的模型名位于 URL 中，原生请求体不添加 OpenAI 风格的 `m
 }
 ```
 
-| 响应参数                               | 含义                     | 当前 SDK 的处理                                       |
-| -------------------------------------- | ------------------------ | ----------------------------------------------------- |
-| `candidates[0].content.parts[].text` | 第一个候选回答的文本片段 | 按顺序拼接，不包含 `thought: true` 的片段           |
-| `candidates[0].finishReason`         | 生成结束原因             | 接受 `STOP`、`MAX_TOKENS`；其他非空原因按失败处理 |
-| `promptFeedback.blockReason`         | 输入被拦截的原因         | 抛出异常                                              |
-| `usageMetadata`                      | Token 使用情况           | 当前文本接口不返回统计                                |
+| 响应参数                               | 含义                     | 当前 SDK 的处理                                                       |
+| -------------------------------------- | ------------------------ | --------------------------------------------------------------------- |
+| `candidates[0].content.parts[].text` | 第一个候选回答的文本片段 | 按顺序拼接，不包含 `thought: true` 的片段                           |
+| `candidates[0].finishReason`         | 生成结束原因             | 接受 `STOP`、`MAX_TOKENS`；工具调用被截断或其他非空原因按失败处理 |
+| `promptFeedback.blockReason`         | 输入被拦截的原因         | 抛出异常                                                              |
+| `usageMetadata`                      | Token 使用情况           | 当前文本接口不返回统计                                                |
 
 **流式响应：SSE**
 
@@ -1308,10 +1334,10 @@ Gemini 原生流不依赖 OpenAI 的 `[DONE]` 标记。当前实现要求出现�
 
 - 支持级别控制的模型可设置 `reasoningEffort = "high"`，发送 `thinkingLevel: "HIGH"`；级别枚举包括 `MINIMAL`、`LOW`、`MEDIUM`、`HIGH`，具体可用项取决于模型。早期模型不支持 `thinkingLevel`。
 - 当前封装仅提供推理级别设置；不支持级别控制的旧模型应保持 `reasoningEffort` 未设置，沿用服务端默认行为。`thinkingEnabled` 在此协议下会被拒绝。SDK 不主动请求输出思考摘要。
-- 当前原生接口每轮通过 `contents` 传入所需历史和新问题；它不会根据本地 `sessionId` 恢复会话。Google SDK 的 chat 辅助对象可以代管历史，本项目直接调用 REST，需由调用方管理 `Session::messages`。
+- 当前原生接口每轮通过 `contents` 传入历史和新问题；Provider 自动从本地或绑定会话中构造这些内容，本地 `sessionId` 不会发送给 Gemini。
 - 每轮保留所需的 `System` 消息，Provider 将其放入独立的 `systemInstruction`；`Assistant` 转为 `model`，`User` 转为 `user`，连续同角色文本合并为多个 `parts`。不要把系统指令混作用户历史。
-- 成功后将最终回复作为一条 `Assistant` 消息保存，下一轮重发所需历史；流式回复同样只保存一次完整文本。裁剪历史时需考虑模型的上下文长度。
-- Gemini 的思考签名 `thoughtSignature` 是不透明的协议数据，不能用普通文本代替。当前 `Message` 不保存原始 `parts` 或签名，也不支持工具结果；要求保留签名的思考延续、工具调用或多模态会话不能靠当前文本历史完整还原。
+- SDK 自动保存本轮完整消息链；模型发起 `functionCall` 后执行已注册工具，再将结果作为 `functionResponse` 继续发送。历史长度仍受模型上下文窗口限制。
+- Gemini 的 `thoughtSignature` 是不透明的协议数据，不能用普通文本代替。当前通过 `Message::protocolData` 保留原始 `parts`，包括签名和工具调用；模型与配置标识匹配且数据结构适用时原样回放，否则使用公共文本和工具字段转换。当前公共消息接口仍以文本和工具会话为主，不提供多模态输入封装。
 
 依据：[Gemini API](https://ai.google.dev/api/generate-content)、[GenerateContent 文本生成](https://ai.google.dev/gemini-api/docs/generate-content/text-generation)、[推理级别](https://ai.google.dev/gemini-api/docs/generate-content/thinking)、[思考签名](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)。
 
@@ -1333,15 +1359,19 @@ POST http://127.0.0.1:11434/api/chat
 
 **请求体参数**
 
-| 参数                                        | 是否必填          | 当前封装的含义                                                                         |
-| ------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------- |
-| `model`                                   | 是                | 已安装的完整模型名，包含实际版本或量化标签                                             |
-| `messages`                                | 是                | 当前封装支持 System、User、Assistant 文本历史                                          |
-| `messages[].role`、`messages[].content` | 是                | 消息角色与文本                                                                         |
-| `stream`                                  | Provider 总是发送 | 普通为 `false`，流式为 `true`；原生 API 的默认值是 `true`                        |
-| `options.temperature`                     | 否                | 采样温度，放在 `options` 中                                                          |
-| `options.num_predict`                     | 否                | 由 `maxOutputTokens` 映射出的输出上限                                                |
-| `think`                                   | 否                | `reasoningEffort` 字符串或 `thinkingEnabled` 布尔值；位于顶层，不在 `options` 内 |
+| 参数                                        | 是否必填             | 当前封装的含义                                                                         |
+| ------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| `model`                                   | 是                   | 已安装的完整模型名，包含实际版本或量化标签                                             |
+| `messages`                                | 是                   | 支持 System、User、Assistant、Tool 的完整历史                                          |
+| `messages[].role`、`messages[].content` | 是                   | 消息角色与文本                                                                         |
+| `tools`                                   | 注册工具时发送       | 工具名称、说明和参数 JSON Schema                                                       |
+| `messages[].tool_calls`                   | Assistant 调用工具时 | 工具名称和参数，参数转换为 JSON 对象                                                   |
+| `messages[].tool_name`                    | Tool 消息使用        | 对应 `Message::toolName`，结果保存在 `content`                                     |
+| `messages[].thinking`                     | 有思考内容时         | 回传 `Message::reasoningContent`                                                     |
+| `stream`                                  | Provider 总是发送    | 普通为 `false`，流式为 `true`；原生 API 的默认值是 `true`                        |
+| `options.temperature`                     | 否                   | 采样温度，放在 `options` 中                                                          |
+| `options.num_predict`                     | 否                   | 由 `maxOutputTokens` 映射出的输出上限                                                |
+| `think`                                   | 否                   | `reasoningEffort` 字符串或 `thinkingEnabled` 布尔值；位于顶层，不在 `options` 内 |
 
 ```json
 {
@@ -1366,14 +1396,15 @@ POST http://127.0.0.1:11434/api/chat
 }
 ```
 
-| 响应参数                              | 含义                       | 当前 SDK 的处理                             |
-| ------------------------------------- | -------------------------- | ------------------------------------------- |
-| `message.content`                   | 可见回复文本               | 作为返回字符串                              |
-| `message.thinking`                  | 模型的思考内容，可能缺省   | 不混入可见回复                              |
-| `done`                              | 本次生成是否完成           | 普通响应必须为 `true`；流式也用它判断结束 |
-| `done_reason`                       | 如自然结束或达到长度限制   | 当前返回接口不单独暴露                      |
-| `prompt_eval_count`、`eval_count` | 输入及输出 Token 数量      | 当前返回接口不单独暴露                      |
-| `total_duration` 等耗时字段         | 原生响应的计时，单位为纳秒 | 当前返回接口不单独暴露                      |
+| 响应参数                              | 含义                       | 当前 SDK 的处理                                           |
+| ------------------------------------- | -------------------------- | --------------------------------------------------------- |
+| `message.content`                   | 可见回复文本               | 汇总到 `ChatResult::content`，并保存在 Assistant 消息中 |
+| `message.tool_calls`                | 模型请求的工具调用         | 保存到 `Message::toolCalls`，执行工具后继续请求         |
+| `message.thinking`                  | 模型的思考内容，可能缺省   | 保存到 `Message::reasoningContent`，不混入可见回复      |
+| `done`                              | 本次生成是否完成           | 普通响应必须为 `true`；流式也用它判断结束               |
+| `done_reason`                       | 如自然结束或达到长度限制   | 当前返回接口不单独暴露                                    |
+| `prompt_eval_count`、`eval_count` | 输入及输出 Token 数量      | 当前返回接口不单独暴露                                    |
+| `total_duration` 等耗时字段         | 原生响应的计时，单位为纳秒 | 当前返回接口不单独暴露                                    |
 
 **流式响应：NDJSON**
 
@@ -1393,7 +1424,158 @@ NDJSON 没有 SSE 的 `data:` 前缀，也没有 `[DONE]`。最后一条记录�
 - 模型支持布尔开关时，设置 `thinkingEnabled = true` 或 `false`；支持分级时，改用 `reasoningEffort`。两者不能同时设置，因为都会映射到同一个 `think` 字段。
 - 字符串级别由模型定义，可通过 Ollama 的 `/api/show` 查看支持值，不能假定每个模型都接受 `low/medium/high`。未设置时不发送 `think`，沿用模型默认行为；非思考模型不能因此获得推理能力。
 - 本地运行也需要每次把所需历史放进 `messages`。模型常驻内存或服务端缓存不会替应用维护这个 SDK 的会话；`keep_alive` 控制模型驻留，与聊天历史管理不同。
-- 每轮发送必要的 `System` 设定、之前的 `User` / `Assistant` 文本以及新问题；SDK 不自动保存和追加消息。成功后把最终回复追加为一条 `Assistant`，流式片段只用于展示，完整回复只保存一次。
-- 上下文仍受本地模型窗口限制，长会话由客户端裁剪或摘要。当前封装忽略响应的 `message.thinking`，不保存完整工具调用结构，并拒绝 `Tool` 消息；需要这些协议数据的会话不能只用当前文本历史恢复。
+- Provider 自动携带 System 设定、之前的 User / Assistant / Tool 消息及新问题，并保存本轮消息链。通过 `bindSession` 可按已有会话 ID 续聊；查询历史使用 `getMessages`，无需手工拼接流式片段或重复追加回复。
+- 当前保存 `message.thinking`、完整工具调用和结果，流式工具调用按完整调用追加。模型必须支持所注册的工具或思考参数；上下文仍受本地模型窗口限制，SDK 暂未自动裁剪或摘要。
 
 依据：[Ollama Chat](https://docs.ollama.com/api/chat)、[Ollama 流式协议](https://docs.ollama.com/api/streaming)。
+
+## 9. SessionManager 会话管理
+
+对应 `SDK/include/SessionManager.hpp`、`SDK/src/SessionManager.cpp`
+`SessionManager` 在内存中保存多组会话和完整消息，负责创建、查询、追加、清空及删除会话数据；模型请求、协议转换和工具执行由 `LLMProvider` 负责。
+
+### 9.1 会话与消息的数据结构
+
+内部使用 `std::unordered_map<std::string, Session>`，以会话 ID 查找会话；每个 `Session` 使用 `std::vector<Message>` 按保存顺序存放消息。
+
+**Session 会话字段**
+
+| 字段                         | 含义                   | 当前实现的处理                                                  |
+| ---------------------------- | ---------------------- | --------------------------------------------------------------- |
+| `sessionId`                | 会话唯一 ID            | 创建会话时生成，后续按此 ID 查询或绑定                          |
+| `userId`                   | 所属用户 ID            | 创建时记录；查询接口当前不按用户过滤                            |
+| `modelConfigId`            | 最近使用的模型连接标识 | 创建时记录初始值，追加新消息后使用最后一条新增消息的配置 ID     |
+| `title`                    | 会话标题               | 创建时传入，默认为空                                            |
+| `messages`                 | 完整历史               | 包括 System、User、Assistant、Tool 消息                         |
+| `createdAt`、`updatedAt` | 创建及最近活动时间     | Unix 毫秒；创建、追加消息、修改系统提示及清空消息时更新相应时间 |
+| `generation`               | 会话消息版本           | 清空消息时递增，用于阻止旧请求重新写回                          |
+
+**Message 消息字段**
+
+| 字段                                     | 含义                     | 当前实现的处理                                             |
+| ---------------------------------------- | ------------------------ | ---------------------------------------------------------- |
+| `messageId`                            | 消息记录 ID              | 已有 ID 保留，用于去重；缺少时生成                         |
+| `role`、`content`                    | 消息角色和文本           | 保留原始角色与内容，Tool 的 `content` 为执行结果         |
+| `createdAt`                            | 消息创建时间             | 为 `0` 时补充当前时间，已有时间保留                      |
+| `toolCalls`                            | Assistant 请求的工具调用 | 保留调用 ID、工具名称及 JSON 参数字符串                    |
+| `toolCallId`、`toolName`             | Tool 消息的关联信息      | 保留协议提供的调用关联和工具名称，调用 ID 可能因协议而为空 |
+| `reasoningContent`、`protocolData`   | 思考及原生协议数据       | 原样保存，协议转换和回放由 Provider 处理                   |
+| `modelConfigId`、`modelName`         | 生成消息时的模型信息     | 保存请求时的快照，不随后续模型切换改变                     |
+| `reasoningEffort`、`thinkingEnabled` | 当时的思考设置           | 保留可选值，未设置与显式关闭分别保存                       |
+
+会话 ID 和消息 ID 分别带 `session`、`message` 前缀，由时间戳、进程内初始化一次的随机标识和原子递增序号组成。多个管理器共享生成序号，清空会话不会重置序号；消息记录 ID 与工具协议中的调用 ID 分开使用。
+
+### 9.2 主要接口
+
+| 接口                                                                  | 做的工作                                       | 返回值或注意事项                                                             |
+| --------------------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------- |
+| `createSession(userId, modelConfigId, title, systemPrompt)`         | 创建会话；非空系统提示保存为首条 System 消息   | 返回新会话 ID，后两个参数默认为空                                            |
+| `getSession(sessionId)`                                             | 查询会话及完整消息                             | 返回 `std::optional<Session>` 快照；不存在为 `std::nullopt`              |
+| `addMessage(sessionId, message, modelConfig)`                       | 追加单条消息                                   | 内部调用 `addMessages`，会话不存在返回 `false`                           |
+| `addMessages(sessionId, messages, modelConfig, expectedGeneration)` | 按原顺序追加一批消息，补充缺失信息并按 ID 去重 | 会话不存在或指定版本不匹配返回 `false`；版本参数默认不检查                 |
+| `getMessages(sessionId)`                                            | 查询完整消息列表                               | 返回 `std::optional<std::vector<Message>>` 快照；不存在为 `std::nullopt` |
+| `getAllSessions()`                                                  | 查询所有会话，按 `updatedAt` 从新到旧排序    | 返回包含各会话完整消息的副本，不自动按用户过滤                               |
+| `setSystemPrompt(sessionId, prompt)`                                | 替换会话中的 System 消息                       | 空字符串移除系统提示；会话不存在返回 `false`                               |
+| `clearMessages(sessionId)`                                          | 清空指定会话的非 System 消息                   | 保留会话和系统提示，递增版本；会话不存在返回 `false`                       |
+| `deleteSession(sessionId)`                                          | 删除指定会话及全部消息                         | 删除成功返回 `true`；不存在返回 `false`                                  |
+| `updateSessionTimestamp(sessionId)`                                 | 显式更新最近活动时间                           | 会话不存在返回 `false`；普通查询不会更新该时间                             |
+| `clearSessions()`                                                   | 清空管理器中的全部会话                         | 不重置 ID 生成序号                                                           |
+| `getSessionCount()`                                                 | 查询当前会话数量                               | 返回 `std::size_t`                                                         |
+| `generateSessionId()`、`generateMessageId()`                      | 单独生成 ID                                    | 静态方法，仅生成标识，不创建记录                                             |
+
+查询返回副本，修改查询结果不会修改管理器中的数据；已经取得的快照也不会随后续删除而失效。
+
+### 9.3 与 LLMProvider 配合使用
+
+**创建、绑定和续聊**
+
+```cpp
+#include "LLMProvider.hpp"
+#include "SessionManager.hpp"
+#include <memory>
+#include <stdexcept>
+
+int main()
+{
+    auto sessions = std::make_shared<modelBridge::SessionManager>();
+
+    modelBridge::ModelConfig config{};
+    config.configId = "local-model";
+    config.model.protocol = modelBridge::ApiProtocol::Ollama;
+    config.model.provider = modelBridge::ProviderType::Ollama;
+    config.model.modelName = "your-local-model:tag"; // 替换为已安装的模型。
+    config.baseUrl = "http://127.0.0.1:11434";
+    config.timeoutSeconds = 120;
+
+    auto sessionId = sessions->createSession("user-1", config.configId, "C++ 学习", "你是一名 C++ 开发工程师。");
+    modelBridge::OllamaProvider provider;
+    if (!provider.initialize(config))
+        throw std::runtime_error(provider.getLastError());
+    if (!provider.bindSession(sessions, sessionId))
+        throw std::runtime_error("会话不存在");
+
+    auto first = provider.sendMessage("解释 Reactor 模型。");
+    auto second = provider.sendMessage("它适合哪些场景？"); // 自动携带前文。
+    auto history = sessions->getMessages(sessionId); // 用于显示完整历史。
+    return 0;
+}
+```
+
+绑定后，每次发送都会读取该会话的当前历史；请求结束后，Provider 将本轮新增消息写回同一会话。`ChatResult::messages` 不包含此前历史，也不包含系统提示，无需在绑定模式下再次手工保存。
+
+用户选择已有会话时，将原会话 ID 传给 `bindSession(sessions, sessionId)` 即可继续聊天。该方法属于 Provider，绑定失败返回 `false`，原绑定保持不变，调用方应检查返回值。新 Provider 仍需初始化；需要执行工具时，还需通过 `setTools` 注册工具定义和实现。
+
+**切换模型与系统提示**
+
+- 同一会话可以使用不同模型或思考设置。调用 `initialize(newConfig)` 切换配置后，绑定会话的历史保留；改用另一个 Provider 时，将其初始化后绑定到同一会话。
+- Provider 在请求开始时取得配置快照，并给新增消息填写模型信息；管理器保留消息已有的模型信息。手工追加的消息若 `modelName` 为空，则使用传入的 `modelConfig` 补充模型与思考设置。
+- 绑定后，`provider.setSystemPrompt` 同步修改该会话的 System 消息，`provider.clearHistory` 清空该会话的非 System 消息。`provider.getHistory()` 不包含 System 消息，完整展示应使用管理器的 `getMessages()`。
+- 未绑定时，Provider 使用独立的本地历史；重新初始化会清空这部分历史。`bindSession(nullptr)` 解除绑定并开始空的本地历史。
+
+### 9.4 消息保存与工具调用记录
+
+管理器保存完整消息结构，不只保存最终回答。例如，一轮工具调用的消息顺序为：
+
+```text
+User：用户问题
+Assistant：工具名称、调用参数及模型返回的文本或思考内容
+Tool：工具执行结果或错误内容
+Assistant：结合工具结果生成的最终回复
+```
+
+通过 `getMessages(sessionId)` 或 `getSession(sessionId)` 可以查看这些记录；显示工具调用时读取 Assistant 的 `toolCalls`，显示工具结果时读取 Tool 消息的 `toolName`、`toolCallId` 和 `content`。流式文本回调不返回完整工具过程，应在消息保存后查询历史，或读取本轮 `ChatResult::messages`。
+
+**追加与去重规则**
+
+- `addMessage`、`addMessages` 按值接收消息，补充 ID、时间和模型信息时不修改调用方原对象。
+- 已有消息 ID 保留；与已存消息或本批次前面的消息 ID 重复时跳过，不覆盖旧内容。空列表或全部重复的消息不会改变会话时间及最近模型标识。
+- 手工创建的消息需要在首次提交前设置稳定 ID，才能对重复提交去重；反复提交空 ID 的消息会被视为新记录。Provider 返回的消息已带 ID，可直接用于保存去重。
+- 成功追加后更新会话的 `updatedAt` 和最近模型配置 ID；系统提示单独保存，后续切换模型不会改写已存消息的模型信息。
+
+### 9.5 并发访问与旧请求处理
+
+内部使用一把 `std::shared_mutex` 保护会话映射和消息。查询使用读锁，新增、修改、清空和删除使用写锁；消息副本的字段准备、ID 生成及会话列表排序放在锁外。管理器不在持锁期间发送模型请求或执行工具。
+
+**清空消息时的版本检查**
+
+Provider 读取历史时同时记录 `Session::generation`，保存时通过 `expectedGeneration` 传回管理器。例如：
+
+```text
+请求开始：读取历史，记录 generation = 0
+清空消息：保留 System，generation 递增为 1
+请求返回：提交时版本仍为 0，与当前版本不匹配，拒绝写回
+```
+
+这可以避免刚清空的历史被在途请求恢复。删除会话后，旧请求也无法重新创建该会话。手工调用 `addMessages` 时，只有显式传入 `expectedGeneration` 才会进行版本检查。
+
+- 每轮已完成的消息链在一次写锁内追加，其他线程不会读到本批次正常追加过程中的中间状态；这属于内存同步，不是数据库事务。
+- 并发请求使用各自开始时的历史，尚未完成的回复对彼此不可见；有上下文先后依赖时，应等待上一轮完成再发送下一轮。
+- 切换模型或绑定会话不会改变已开始请求的归属；其结果仍保存到原会话，原会话已清空或删除时不再写回。
+- 调用期间入参须保持有效且不被其他线程修改；销毁管理器及 Provider 前须等待相关调用结束。工具或回调捕获的外部共享数据仍由调用方同步。
+
+### 9.6 当前实现范围
+
+- 当前只管理内存数据，尚未接入 SQLite，进程结束后不能恢复会话。
+- 保存模型配置 ID、模型名称和思考设置，不保存完整连接配置、API Key 或可执行工具函数，也不自动恢复这些运行配置。
+- 查询接口返回数据，不负责界面展示；历史中保留工具记录不代表已自动重新注册工具。
+- 管理器不自动裁剪、摘要历史或分页查询，长会话仍需考虑模型上下文窗口与内存占用。

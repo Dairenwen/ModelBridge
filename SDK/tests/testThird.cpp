@@ -21,12 +21,14 @@ namespace
             // 仅用于测试准备：借用已有切换入口选择 Responses，不发送 Chat 请求。
             Json::Value error;
             error["error"]["code"] = "protocol_not_supported";
-            OpenAICompatibleProvider::tryProtocolFallback(error);
+            RequestContext context;
+            OpenAICompatibleProvider::tryProtocolFallback(error, context);
+            OpenAICompatibleProvider::rememberProtocol(context);
         }
 
-        std::string makeRequestPath(bool stream) const override
+        std::string makeRequestPath(bool stream, const RequestContext &context) const override
         {
-            lastRequestPath = OpenAICompatibleProvider::makeRequestPath(stream);
+            lastRequestPath = OpenAICompatibleProvider::makeRequestPath(stream, context);
             return lastRequestPath;
         }
     };
