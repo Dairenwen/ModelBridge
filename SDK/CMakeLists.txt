@@ -41,9 +41,13 @@ target_include_directories(modelbridge_sdk
 )
 
 target_compile_definitions(modelbridge_sdk PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-target_link_libraries(modelbridge_sdk
-    PUBLIC spdlog::spdlog Threads::Threads JsonCpp::JsonCpp SQLite::SQLite3
-    PRIVATE OpenSSL::SSL OpenSSL::Crypto
+target_link_libraries(modelbridge_sdk PUBLIC
+    spdlog::spdlog
+    Threads::Threads
+    JsonCpp::JsonCpp
+    SQLite::SQLite3
+    PRIVATE OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # 静态库

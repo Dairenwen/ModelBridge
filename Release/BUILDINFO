@@ -1,0 +1,16 @@
+Name: ModelBridge
+Build date: 2026-10-24
+Platform: Ubuntu 24.04 aarch64
+Compiler: GCC 13.3.0
+CMake: 3.28.3
+C++ standard: 17
+Build type: Release
+Library: libmodelbridge_sdk.a (SDK static; system dependencies linked separately)
+Source revision: 800c98b4a5790a1fe96c7d78b0da42b4c866496c
+Source state: working tree, including uncommitted SDK changes
+cpp-httplib: 0.61.0
+cpp-httplib header SHA256: 81220a7f83d6bfdf75f73b2b41c7bd98ac124ed22b8386abb86238a0c236d166
+JsonCpp: 1.9.5
+spdlog: 1.12.0
+SQLite: 3.45.1
+OpenSSL: 3.0.13

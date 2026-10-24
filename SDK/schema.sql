@@ -1,4 +1,4 @@
--- 默认文件：SDK/DBFiles/modelbridge.db；也可由调用方传入其他路径。
+-- 默认文件：当前工作目录下的 DBFiles/modelbridge.db；也可由调用方传入其他路径。
 -- 外键由连接初始化时的 PRAGMA foreign_keys = ON 启用。
 
 -- 会话元数据；generation 在清空聊天消息时递增。

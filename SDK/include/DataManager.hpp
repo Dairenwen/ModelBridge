@@ -21,7 +21,7 @@ namespace modelBridge
             VersionMismatch
         };
 
-        /** @brief 打开数据库并建表；路径为空时使用 SDK/DBFiles/modelbridge.db。
+        /** @brief 打开数据库并建表；路径为空时使用当前工作目录下的 DBFiles/modelbridge.db。
          * @param databasePath 数据库路径，支持 SQLite 的 :memory: 路径。
          * 初始化失败抛出异常，已有数据库内容保留。
          */

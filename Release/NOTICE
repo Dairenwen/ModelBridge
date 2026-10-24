@@ -1,0 +1,10 @@
+ModelBridge: see LICENSE.
+
+cpp-httplib 0.61.0
+Copyright (c) 2017 yhirose; MIT License.
+https://github.com/yhirose/cpp-httplib/tree/v0.61.0
+Source license: third_party/cpp-httplib/LICENSE
+Binary license: share/licenses/cpp-httplib/LICENSE
+
+System dependencies: spdlog, fmt, JsonCpp, OpenSSL, SQLite and Threads.
+System dependencies are not bundled into this SDK archive.

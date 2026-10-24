@@ -267,6 +267,10 @@ namespace modelBridge
                         failure["error"] = error.what();
                         output.content = compactJson(failure);
                     }
+                    catch (...)
+                    {
+                        output.content = "{\"error\":\"Tool execution failed with an unknown exception\"}";
+                    }
                     stamp(output);
                     messages.push_back(output);
                     result.messages.push_back(output);
@@ -414,7 +418,11 @@ namespace modelBridge
                 }
             }
             else
+            {
                 result.content = readResponse(parseJson(response->body), false, result, finished, context);
+                if (!finished)
+                    throw std::runtime_error("Model response ended without completion information");
+            }
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
             MB_LOG_INFO("模型请求完成：model={}，HTTP={}，回复字节数={}，耗时={}ms", config.model.modelName, status, result.content.size(), elapsed);
             return result;

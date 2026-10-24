@@ -4,9 +4,9 @@
 
 ### 1.1 项目介绍
 
-ModelBridge — C++ 多模型统一接入框架 是一个基于 C++ 开发的大语言模型接入与聊天系统。
+ModelBridge — C++ 多模型统一接入框架 是一个基于 C++17 开发的大语言模型接入 SDK。
 
-项目旨在通过统一的 ChatSDK 接口，屏蔽不同大模型服务之间的调用差异，实现云端大模型与本地大模型的统一管理，并在此基础上开发支持多模型、多轮会话、流式响应和历史记录管理的 AI 聊天应用。
+项目通过统一的 LLMProvider 接口，屏蔽不同大模型服务之间的调用差异，实现云端大模型与本地大模型的统一调用，并提供工具调用、多轮会话、流式响应和历史记录持久化能力，供上层 AI 聊天应用使用。
 
 **核心目标：**
 
@@ -16,20 +16,21 @@ ModelBridge — C++ 多模型统一接入框架 是一个基于 C++ 开发的大
 - 封装统一的大模型访问接口，降低业务代码与具体模型服务的耦合。
 - 实现多轮对话、会话管理和消息持久化。
 - 支持同步响应与流式响应。
-- 在 ChatSDK 基础上构建完整的 AI 聊天应用。
+- 在 SDK 基础上扩展 AI 聊天应用。
 
 ### 1.2 项目主要功能
 
 | 功能模块     | 功能描述                                 |
 | ------------ | ---------------------------------------- |
-| 模型管理     | 获取支持的模型、初始化和管理不同模型     |
+| 模型配置     | 初始化模型连接，切换模型及调用参数       |
 | 云端模型接入 | 调用 DeepSeek、OpenAI、Gemini 等模型 API |
 | 本地模型接入 | 通过 Ollama 调用本地部署的模型           |
-| 会话创建     | 为指定模型创建独立会话                   |
+| 会话创建     | 按用户创建独立会话并分配唯一 ID          |
 | 会话管理     | 获取会话列表、查询会话信息、删除会话     |
 | 多轮对话     | 根据历史消息维护对话上下文               |
 | 普通响应     | 等待模型生成完成后，一次性返回完整结果   |
 | 流式响应     | 模型生成部分内容后，逐步返回给调用方     |
+| 工具调用     | 注册工具，执行模型请求的工具并回传结果   |
 | 数据持久化   | 使用 SQLite 保存会话及历史消息           |
 | 日志管理     | 通过 spdlog 记录运行信息与错误           |
 
@@ -39,68 +40,50 @@ ModelBridge — C++ 多模型统一接入框架 是一个基于 C++ 开发的大
 
 ### 2.1 分层设计
 
-项目采用分层设计，主要由应用层、ChatSDK 核心层、数据存储层和模型服务层构成。
+项目采用分层设计，主要由调用方、SDK 核心模块、数据存储层和模型服务层构成。
 
 ```mermaid
 flowchart TD
-    A["Web 前端 / 客户端"]
-    B["ChatServer（HTTP 服务）"]
-    C["ChatSDK（统一大模型接入层）"]
+    A["调用方（命令行 / 业务应用）"]
+    C["ModelBridge SDK"]
 
-    D["LLMManager"]
+    D["LLMProvider"]
     E["SessionManager"]
     F["DataManager"]
 
-    G["DeepSeekProvider"]
-    H["ChatGPTProvider"]
+    H["OpenAICompatibleProvider"]
     I["GeminiProvider"]
     J["OllamaProvider"]
 
-    K["DeepSeek API"]
-    L["OpenAI API"]
+    K["OpenAI / DeepSeek / 百炼等兼容 API"]
     M["Gemini API"]
     N["本地 Ollama 服务"]
 
     O[("SQLite 数据库")]
 
-    A <-->|HTTP| B
-    B --> C
+    A --> C
 
     C --> D
     C --> E
-    C --> F
 
-    D --> G
     D --> H
     D --> I
     D --> J
 
-    G <-->|HTTPS| K
-    H <-->|HTTPS| L
+    H <-->|HTTP/HTTPS| K
     I <-->|HTTPS| M
     J <-->|HTTP| N
 
-    E --> F
+    D -->|绑定会话| E
+    E -->|可选持久化| F
     F <--> O
 ```
 
 ### 2.2 核心模块职责
 
-#### ChatServer：应用服务层
+#### ModelBridge SDK：统一接入层
 
-负责向客户端提供 HTTP 接口。
-
-主要职责：
-
-- 接收客户端请求。
-- 解析请求参数。
-- 调用 ChatSDK。
-- 将处理结果返回客户端。
-- 将流式模型输出转发给客户端。
-
-#### ChatSDK：统一接入层
-
-ChatSDK 是项目的核心模块。
+SDK 是项目的核心模块，由 LLMProvider、SessionManager 和 DataManager 配合使用。
 
 它主要负责：
 
@@ -111,11 +94,11 @@ ChatSDK 是项目的核心模块。
 - 提供普通和流式消息接口。
 - 协调会话数据的持久化。
 
-#### LLMManager：模型管理器
+#### LLMProvider：统一模型接口
 
-负责管理不同的大模型 Provider。
+负责模型连接初始化、普通和流式请求、工具执行及历史消息衔接。
 
-不同模型的访问逻辑分别由对应的 Provider 实现，LLMManager 对它们进行统一管理。
+不同协议的访问逻辑由对应的 Provider 子类实现，调用方通过统一接口使用。
 
 这样可以避免业务层针对每个模型分别编写调用代码。
 
@@ -125,14 +108,13 @@ Provider 负责具体模型的 API 调用。
 
 例如：
 
-- `DeepSeekProvider`：对接 DeepSeek。
-- `ChatGPTProvider`：对接 OpenAI。
+- `OpenAICompatibleProvider`：对接 OpenAI、DeepSeek、百炼等兼容接口。
 - `GeminiProvider`：对接 Gemini。
 - `OllamaProvider`：对接本地 Ollama。
 
 不同 Provider 对应不同的请求地址、认证方式、请求体及响应解析逻辑。
 
-这里使用的是功能上的名称；实际源码中的类名应以当前 SDK 为准，例如你安装的版本中存在 `OllamaLLMProvider.h`。
+上述接口及三个实现类统一声明在 `SDK/include/LLMProvider.hpp` 中。
 
 #### SessionManager：会话管理器
 
@@ -142,35 +124,34 @@ Provider 负责具体模型的 API 调用。
 
 - 创建会话。
 - 根据会话 ID 查找会话。
-- 获取会话列表。
-- 管理消息上下文。
+- 获取指定用户的会话列表。
+- 管理完整消息上下文，支持清空历史和恢复会话。
 - 删除会话。
 
 #### DataManager：数据管理器
 
 负责将会话及历史消息持久化到 SQLite 数据库。
 
-通过持久化存储，可以避免程序退出后所有聊天记录都只保留在内存中。
+通过构造参数注入 SessionManager 后启用持久化，使用事务保存完整消息链，程序重启后可按原会话 ID 恢复历史；未注入时使用内存模式。
 
 ## 3. 核心技术栈
 
 ### 3.1 第三方库
 
-| 技术        | 功能                 | 在项目中的作用               |
-| ----------- | -------------------- | ---------------------------- |
-| C++17       | 开发语言标准         | 实现 ChatSDK 和业务服务      |
-| CMake       | 项目构建             | 管理编译与链接               |
-| cpp-httplib | HTTP 客户端/服务器库 | 发送模型请求、提供 HTTP 接口 |
-| JsonCpp     | JSON 处理库          | JSON 序列化和反序列化        |
-| spdlog      | 日志库               | 日志记录与问题排查           |
-| fmt         | 字符串格式化         | 格式化输出                   |
-| SQLite      | 嵌入式数据库         | 存储会话及历史消息           |
-| gflags      | 命令行参数解析       | 管理启动参数和配置           |
-| OpenSSL     | TLS/SSL              | 支持 HTTPS 通信              |
-| GoogleTest  | C++ 测试框架         | 编写单元测试                 |
-| curl        | HTTP 测试工具        | 调试模型 API                 |
-| Ollama      | 本地模型运行环境     | 加载模型并提供推理接口       |
-| Postman     | API 调试工具         | 测试 HTTP 请求和响应         |
+| 技术        | 功能                 | 在项目中的作用                 |
+| ----------- | -------------------- | ------------------------------ |
+| C++17       | 开发语言标准         | 实现 SDK 核心模块              |
+| CMake       | 项目构建             | 管理静态库编译、链接与安装     |
+| cpp-httplib | HTTP 客户端/服务器库 | 向模型服务发送 HTTP/HTTPS 请求 |
+| JsonCpp     | JSON 处理库          | JSON 序列化和反序列化          |
+| spdlog      | 日志库               | 日志记录与问题排查             |
+| fmt         | 字符串格式化         | 格式化输出                     |
+| SQLite      | 嵌入式数据库         | 存储会话及历史消息             |
+| OpenSSL     | TLS/SSL              | 支持 HTTPS 通信                |
+| GoogleTest  | C++ 测试框架         | 编写单元测试                   |
+| curl        | HTTP 测试工具        | 调试模型 API                   |
+| Ollama      | 本地模型运行环境     | 加载模型并提供推理接口         |
+| Postman     | API 调试工具         | 测试 HTTP 请求和响应           |
 
 ## 4. 大模型 HTTP API 调用
 
@@ -200,7 +181,9 @@ sequenceDiagram
 3. 设置 HTTP 请求头。
 4. 发送 HTTP 请求。
 5. 接收服务端响应。
-6. 解析 JSON 并提取模型生成内容。
+6. 解析 JSON，提取模型文本、工具调用和协议数据。
+
+这些步骤由 Provider 完成。绑定会话后，Provider 自动读取历史，并通过 SessionManager 保存本轮完整消息链。
 
 ### 4.2 常见消息角色
 
@@ -208,12 +191,12 @@ sequenceDiagram
 | --------- | ------------------------ |
 | system    | 设置模型的角色和行为要求 |
 | user      | 用户输入                 |
-| assistant | 模型之前生成的回复       |
+| assistant | 模型回复或工具调用请求   |
 | tool      | 工具调用执行结果         |
 
 其中，`system`、`user` 和 `assistant` 是普通聊天中最常用的三类角色。
 
-例如：
+以下以 OpenAI 兼容协议为例；Gemini 等原生协议由对应 Provider 转换消息格式。
 
 ```json
 {
@@ -250,6 +233,8 @@ API Key 的主要作用：
 Authorization: Bearer YOUR_API_KEY
 ```
 
+Gemini 使用 `x-goog-api-key` 请求头；无需认证的本地 Ollama 可不设置密钥。
+
 例如：
 
 ```http
@@ -276,32 +261,54 @@ if (apiKey == nullptr) {
 }
 ```
 
----
+SDK 也可通过 `ModelConfig::apiKeyEnv` 指定环境变量名，在 `initialize()` 时读取；直接设置 `apiKey` 时优先使用该值。
 
-## 5. ChatSDK 核心接口
+## 5. ModelBridge 核心接口
 
-### 5.1 ChatSDK 的职责
+### 5.1 ModelBridge 的职责
 
-### 5.2 ChatSDK 主要 API
+LLMProvider 负责模型调用，SessionManager 负责会话和完整历史，DataManager 负责可选的 SQLite 持久化。调用方按需组合使用。
+
+### 5.2 ModelBridge 主要 API
+
+| 所属类         | 接口                                                          | 功能                             |
+| -------------- | ------------------------------------------------------------- | -------------------------------- |
+| LLMProvider    | `initialize(config)`                                        | 初始化模型连接和调用参数         |
+| LLMProvider    | `bindSession(manager, sessionId)`                           | 绑定已有会话并自动读取、保存历史 |
+| LLMProvider    | `setTools(tools)`                                           | 注册工具声明及执行函数           |
+| LLMProvider    | `sendMessage(message)`                                      | 发送消息并返回完整结果           |
+| LLMProvider    | `sendMessageStream(message, callback)`                      | 发送消息并逐步回调文本           |
+| SessionManager | `createSession(userId, modelConfigId, title, systemPrompt)` | 创建会话，后两个参数可省略       |
+| SessionManager | `getSessions(userId)` / `getMessages(sessionId)`          | 查询用户会话列表或完整消息       |
+| SessionManager | `restoreSession(sessionId)`                                 | 按原 ID 恢复数据库中的会话       |
+| SessionManager | `clearMessages(sessionId)` / `deleteSession(sessionId)`   | 清空历史或删除会话               |
+| DataManager    | `DataManager(databasePath)`                                 | 打开或创建数据库并初始化表结构   |
 
 ### 5.3 核心调用流程
+
+创建 DataManager（可选）→ 创建 SessionManager → 创建或恢复会话 → 初始化 Provider → 绑定会话 → 注册工具（可选）→ 发送消息。
+
+重新运行时，打开同一数据库并恢复原会话即可续聊；模型连接配置和工具仍由调用方初始化。绑定后历史自动保存，无需重复追加返回的消息。
 
 ### 5.4 普通响应与流式响应
 
 #### 普通响应
 
+`sendMessage()` 等待本轮完成后返回 `ChatResult`。其中 `content` 是可见回复文本，`messages` 是本轮新增的 User、Assistant 和 Tool 消息链。
+
 #### 流式响应
+
+`sendMessageStream()` 通过回调返回文本增量，保存本轮历史后调用一次 `callback("", true)`，并返回同样的 `ChatResult`。该方法阻塞执行，回调在调用线程中执行。
 
 ## 6. 开发环境与项目构建
 
 ### 6.1 开发环境
 
-课程采用 Linux 环境和 CMake 构建系统，推荐使用支持 Remote SSH 的 IDE 进行开发。
+项目使用 C++17 和 CMake 3.16 及以上版本构建，推荐使用 Linux 开发环境和支持 Remote SSH 的 IDE。
 
 常用开发工具：
 
-- VS Code / Trae 等 C++ IDE。
-- clangd：代码补全、错误检查和代码导航。
+- VS Code 等 C++ IDE。
 - CMake Tools：管理 CMake 项目构建。
 - Git：版本控制。
 - Postman：HTTP API 调试。
@@ -320,7 +327,6 @@ apt install -y \
     git \
     pkg-config \
     curl \
-    libgflags-dev \
     libspdlog-dev \
     libfmt-dev \
     libjsoncpp-dev \
@@ -335,6 +341,7 @@ apt install -y \
 - `libsqlite3-dev` 提供 SQLite 开发文件。
 - `libssl-dev` 提供 OpenSSL 开发文件。
 - `build-essential` 提供常用 C/C++ 编译工具。
+- `libgtest-dev` 用于构建测试，关闭 `BUILD_TESTING` 时不需要。
 
 ### 6.3 cpp-httplib 安装
 
@@ -343,7 +350,7 @@ cpp-httplib 是轻量级 C++ HTTP 库，常用的单头文件版本可以直接�
 克隆源码：
 
 ```bash
-git clone https://github.com/yhirose/cpp-httplib.git
+git clone --branch v0.61.0 --depth 1 https://github.com/yhirose/cpp-httplib.git
 ```
 
 进入目录：
@@ -365,6 +372,26 @@ cp httplib.h /usr/local/include/
 ```
 
 也可以将固定版本的 `httplib.h` 放入项目的第三方依赖目录，避免依赖系统全局安装。
+
+### 6.4 编译与安装
+
+在项目根目录执行：
+
+```bash
+cmake -S SDK -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build -j
+sudo make -C build install
+```
+
+默认安装静态库、公开头文件及 CMake 包配置到 `/usr/local`。其他项目通过以下方式链接：
+
+```cmake
+find_package(ModelBridge CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE ModelBridge::modelbridge_sdk)
+```
+
+当前预编译包适用于 Ubuntu 24.04 ARM64，其他 Linux 架构可从源码编译。发布包安装和完整示例见 [Release 使用手册](Release/README.md)。
 
 ## 7. 使用 Postman 调试本地 Ollama
 
@@ -1590,7 +1617,7 @@ DataManager：在同一个事务中追加消息、分配顺序号并更新会话
 
 ### 10.1 数据库与保存内容
 
-构造 `DataManager` 时打开或创建数据库，并创建必要的数据表和索引；再次打开已有数据库会保留原数据。默认文件为 `SDK/DBFiles/modelbridge.db`，也可传入自定义路径；对象销毁时释放连接。
+构造 `DataManager` 时打开或创建数据库，并创建必要的数据表和索引；再次打开已有数据库会保留原数据。默认文件为程序当前工作目录下的 `DBFiles/modelbridge.db`，也可传入自定义路径；对象销毁时释放连接。
 
 | 数据表 / 字段                            | 做的工作                   | 当前实现的处理                                                        |
 | ---------------------------------------- | -------------------------- | --------------------------------------------------------------------- |
@@ -1691,3 +1718,109 @@ auto result = provider.sendMessage("接着上次的内容，它适合哪些场�
 - 普通及流式回复均在完整消息链保存后返回；流式的完成回调在保存之后触发。数据库保存失败会抛出异常，不发送完成通知。
 - 首个请求失败时不保存孤立的 User 消息；工具执行后若后续请求失败，已经完成的消息和工具结果仍保存，未完成的响应不保存。
 - 销毁对象前须等待相关调用结束。
+
+## 项目扩展：RESTful API 设计
+
+### 1. RESTful API 简介
+
+RESTful API 是一种基于 HTTP 协议的接口设计风格，REST 是 Representational State Transfer（表现层状态转移）的缩写。
+
+其核心思想是：**将系统中的数据和功能抽象为资源，通过 URL 标识资源，使用 HTTP 请求方法对资源进行操作，并通过 JSON 等格式交换数据。**
+
+RESTful API 具有以下特点：
+
+- **资源化设计**：使用 URL 标识资源，例如用户、会话、消息等。
+- **统一操作方式**：使用 GET、POST、PUT、PATCH、DELETE 等 HTTP 方法。
+- **无状态通信**：每个请求独立，包含服务器处理请求所需的信息。
+- **统一数据格式**：通常使用 JSON 传递请求参数和响应结果。
+- **前后端解耦**：客户端只需遵循接口规范，无需了解服务端内部实现。
+
+### 2. RESTful API 设计方法
+
+RESTful API 通常按照 **资源定义 → URL 设计 → HTTP 方法选择 → 请求参数设计 → 响应结果设计** 的流程进行。
+
+**（1）定义资源与 URL**
+
+URL 应主要使用名词表示资源，而不是使用动词描述操作。
+
+例如：
+
+```text
+/api/users           # 用户资源集合
+/api/users/1001      # ID为1001的用户
+/api/sessions        # 会话资源集合
+/api/sessions/abc123 # ID为abc123的会话
+```
+
+**（2）使用 HTTP 方法定义操作**
+
+以会话管理为例：
+
+| HTTP 方法 | 请求 URL              | 功能             |
+| --------- | --------------------- | ---------------- |
+| GET       | `/api/sessions`     | 获取会话列表     |
+| GET       | `/api/sessions/123` | 获取指定会话     |
+| POST      | `/api/sessions`     | 创建新会话       |
+| PUT       | `/api/sessions/123` | 整体更新指定会话 |
+| PATCH     | `/api/sessions/123` | 部分更新指定会话 |
+| DELETE    | `/api/sessions/123` | 删除指定会话     |
+
+同一个资源可以通过不同 HTTP 方法执行不同操作，从而避免为每项操作设计独立的动词式 URL。
+
+**（3）设计请求参数**
+
+例如，创建一个新会话：
+
+```http
+POST /api/sessions HTTP/1.1
+Content-Type: application/json
+
+{
+    "model": "qwen3",
+    "title": "新的对话"
+}
+```
+
+请求主要包含：
+
+- **请求方法**：`POST`，表示创建资源。
+- **请求路径**：`/api/sessions`，表示会话资源集合。
+- **请求头**：`Content-Type` 声明请求体的数据格式。
+- **请求体**：使用 JSON 提供模型名称、会话标题等参数。
+
+**（4）设计统一响应格式**
+
+接口可以统一使用 `success`、`message`、`data` 三个字段。
+
+例如，创建会话成功后返回：
+
+```json
+{
+    "success": true,
+    "message": "Session created successfully",
+    "data": {
+        "session_id": "abc123",
+        "model": "qwen3",
+        "title": "新的对话"
+    }
+}
+```
+
+同时使用标准 HTTP 状态码表示处理结果：
+
+| 状态码                    | 含义             |
+| ------------------------- | ---------------- |
+| 200 OK                    | 请求成功         |
+| 201 Created               | 资源创建成功     |
+| 400 Bad Request           | 请求参数错误     |
+| 401 Unauthorized          | 缺少有效身份认证 |
+| 404 Not Found             | 请求资源不存在   |
+| 500 Internal Server Error | 服务器内部错误   |
+
+### 3. 项目扩展方向
+
+当前主要提供 C++ 接口供应用程序调用，后续可以在 SDK 基础上封装 RESTful API，构建独立的 HTTP 服务。
+
+服务端可以使用 `cpp-httplib` 注册请求路由，根据 HTTP 方法和 URL 将请求分发到对应处理函数，由处理函数调用 ChatSDK 完成模型交互、会话管理等操作，并将结果封装为 JSON 或流式响应返回客户端。
+
+通过这一扩展，可以让浏览器、移动端以及其他编程语言编写的客户端，通过统一的 HTTP 接口使用 ChatSDK 的功能，降低 SDK 的接入成本，提高系统的可扩展性与跨平台使用能力。

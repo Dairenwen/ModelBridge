@@ -3,6 +3,6 @@
 // 由 CMake 从 schema.sql 生成，运行时不依赖源码目录中的 SQL 文件。
 namespace modelBridge::detail
 {
-    inline constexpr char defaultDatabasePath[] = R"mbpath(@CMAKE_CURRENT_SOURCE_DIR@/DBFiles/modelbridge.db)mbpath";
+    inline constexpr char defaultDatabasePath[] = "DBFiles/modelbridge.db";
     inline constexpr char databaseSchema[] = R"mbsql(@MODELBRIDGE_SCHEMA_SQL@)mbsql";
 }
