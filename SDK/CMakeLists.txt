@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(ModelBridge LANGUAGES CXX)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 # 统一使用标准 C++17，禁止回退到旧标准或启用编译器扩展。
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +15,7 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(jsoncpp CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_path(HTTPLIB_INCLUDE_DIR NAMES httplib.h)
 
 # 使用同一份带注释的 SQL 初始化数据库，避免运行时查找源码文件。
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema.sql")
@@ -28,16 +32,40 @@ file(GLOB_RECURSE SDK_SOURCES CONFIGURE_DEPENDS
 
 list(REMOVE_ITEM SDK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 add_library(modelbridge_sdk STATIC ${SDK_SOURCES} ${SDK_HEADERS})
+add_library(ModelBridge::modelbridge_sdk ALIAS modelbridge_sdk)
+target_compile_features(modelbridge_sdk PUBLIC cxx_std_17)
 target_include_directories(modelbridge_sdk
-    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
-           ${SQLite3_INCLUDE_DIRS}
-    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+           "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ModelBridge>"
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated" "${HTTPLIB_INCLUDE_DIR}"
 )
 
 target_compile_definitions(modelbridge_sdk PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(modelbridge_sdk
-    PUBLIC spdlog::spdlog Threads::Threads JsonCpp::JsonCpp ${SQLite3_LIBRARIES}
+    PUBLIC spdlog::spdlog Threads::Threads JsonCpp::JsonCpp SQLite::SQLite3
     PRIVATE OpenSSL::SSL OpenSSL::Crypto
+)
+
+# 静态库
+set(MODELBRIDGE_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/ModelBridge")
+configure_package_config_file(
+    cmake/ModelBridgeConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/ModelBridgeConfig.cmake"
+    INSTALL_DESTINATION "${MODELBRIDGE_CMAKE_INSTALL_DIR}"
+)
+install(TARGETS modelbridge_sdk EXPORT ModelBridgeTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+)
+install(FILES ${SDK_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/ModelBridge")
+install(EXPORT ModelBridgeTargets NAMESPACE ModelBridge::
+    DESTINATION "${MODELBRIDGE_CMAKE_INSTALL_DIR}"
+)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ModelBridgeConfig.cmake"
+    DESTINATION "${MODELBRIDGE_CMAKE_INSTALL_DIR}"
+)
+install(FILES schema.sql DESTINATION "${CMAKE_INSTALL_DATADIR}/ModelBridge")
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../LICENSE"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/ModelBridge"
 )
 
 add_executable(modelbridge src/main.cpp)

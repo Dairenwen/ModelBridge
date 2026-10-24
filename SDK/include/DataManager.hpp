@@ -9,19 +9,23 @@ namespace modelBridge
     /**
      * @brief 使用单连接保存 SQLite 会话数据；公开操作内部加锁。
      * 数据库错误抛出 std::runtime_error，不与无记录或版本过期混淆。
-     * 不生成业务 ID、不执行工具；销毁前调用方须等待所有调用结束。
      */
     class DataManager
     {
     public:
         /// 消息提交结果；数据库错误通过异常反馈。
-        enum class WriteResult { Success, NotFound, VersionMismatch };
+        enum class WriteResult
+        {
+            Success,
+            NotFound,
+            VersionMismatch
+        };
 
         /** @brief 打开数据库并建表；路径为空时使用 SDK/DBFiles/modelbridge.db。
          * @param databasePath 数据库路径，支持 SQLite 的 :memory: 路径。
          * 初始化失败抛出异常，已有数据库内容保留。
          */
-        explicit DataManager(const std::string &databasePath = "");
+        DataManager(const std::string &databasePath = "");
         /** @brief 关闭数据库，释放连接资源。 */
         ~DataManager();
         DataManager(const DataManager &) = delete;
@@ -94,6 +98,6 @@ namespace modelBridge
 
     private:
         sqlite3 *db = nullptr;
-        mutable std::mutex databaseMutex; ///< 覆盖一次完整读写或事务，不只保护单条 SQL。
+        mutable std::mutex databaseMutex; ///< 覆盖一次完整读写或事务。
     };
 } // namespace modelBridge

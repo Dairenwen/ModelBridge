@@ -1,4 +1,3 @@
--- SQLite 不使用 CREATE DATABASE；DataManager 通过 sqlite3_open 创建数据库文件。
 -- 默认文件：SDK/DBFiles/modelbridge.db；也可由调用方传入其他路径。
 -- 外键由连接初始化时的 PRAGMA foreign_keys = ON 启用。
 
@@ -13,8 +12,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     generation INTEGER NOT NULL CHECK (generation >= 0)
 );
 
--- position 仅用于数据库排序，不改变消息 ID 或创建时间。
--- 可为负数，便于替换系统提示时将新 System 消息放在现有历史前面。
+-- position 仅用于数据库排序，不改变消息 ID 或创建时间。可为负数，便于替换系统提示时将新 System 消息放在现有历史前面。
 CREATE TABLE IF NOT EXISTS messages (
     sessionId TEXT NOT NULL REFERENCES sessions(sessionId) ON DELETE CASCADE,
     messageId TEXT NOT NULL,
@@ -35,7 +33,5 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (sessionId, position)
 );
 
--- 消息唯一约束同时建立按会话与顺序查询所需的索引。
--- 列表查询只读取会话表，不加载消息正文。
-CREATE INDEX IF NOT EXISTS sessions_user_updated
-    ON sessions(userId, updatedAt DESC, sessionId);
+-- 消息唯一约束同时建立按会话与顺序查询所需的索引。列表查询只读取会话表，不加载消息正文。
+CREATE INDEX IF NOT EXISTS sessions_user_updated ON sessions(userId, updatedAt DESC, sessionId);

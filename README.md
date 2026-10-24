@@ -1432,7 +1432,7 @@ NDJSON 没有 SSE 的 `data:` 前缀，也没有 `[DONE]`。最后一条记录�
 ## 9. SessionManager 会话管理
 
 对应 `SDK/include/SessionManager.hpp`、`SDK/src/SessionManager.cpp`
-`SessionManager` 在内存中保存多组会话和完整消息，负责创建、查询、追加、清空及删除会话数据；模型请求、协议转换和工具执行由 `LLMProvider` 负责。
+`SessionManager` 默认在内存中保存多组会话和完整消息，负责创建、查询、追加、清空及删除会话数据；构造时传入 `DataManager` 可启用 SQLite 持久化，具体用法见第 10 节。模型请求、协议转换和工具执行由 `LLMProvider` 负责。
 
 ### 9.1 会话与消息的数据结构
 
@@ -1443,7 +1443,7 @@ NDJSON 没有 SSE 的 `data:` 前缀，也没有 `[DONE]`。最后一条记录�
 | 字段                         | 含义                   | 当前实现的处理                                                  |
 | ---------------------------- | ---------------------- | --------------------------------------------------------------- |
 | `sessionId`                | 会话唯一 ID            | 创建会话时生成，后续按此 ID 查询或绑定                          |
-| `userId`                   | 所属用户 ID            | 创建时记录；查询接口当前不按用户过滤                            |
+| `userId`                   | 所属用户 ID            | 创建时记录；`getSessions(userId)` 按用户查询会话概要          |
 | `modelConfigId`            | 最近使用的模型连接标识 | 创建时记录初始值，追加新消息后使用最后一条新增消息的配置 ID     |
 | `title`                    | 会话标题               | 创建时传入，默认为空                                            |
 | `messages`                 | 完整历史               | 包括 System、User、Assistant、Tool 消息                         |
@@ -1467,21 +1467,25 @@ NDJSON 没有 SSE 的 `data:` 前缀，也没有 `[DONE]`。最后一条记录�
 
 ### 9.2 主要接口
 
-| 接口                                                                  | 做的工作                                       | 返回值或注意事项                                                             |
-| --------------------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------- |
-| `createSession(userId, modelConfigId, title, systemPrompt)`         | 创建会话；非空系统提示保存为首条 System 消息   | 返回新会话 ID，后两个参数默认为空                                            |
-| `getSession(sessionId)`                                             | 查询会话及完整消息                             | 返回 `std::optional<Session>` 快照；不存在为 `std::nullopt`              |
-| `addMessage(sessionId, message, modelConfig)`                       | 追加单条消息                                   | 内部调用 `addMessages`，会话不存在返回 `false`                           |
-| `addMessages(sessionId, messages, modelConfig, expectedGeneration)` | 按原顺序追加一批消息，补充缺失信息并按 ID 去重 | 会话不存在或指定版本不匹配返回 `false`；版本参数默认不检查                 |
-| `getMessages(sessionId)`                                            | 查询完整消息列表                               | 返回 `std::optional<std::vector<Message>>` 快照；不存在为 `std::nullopt` |
-| `getAllSessions()`                                                  | 查询所有会话，按 `updatedAt` 从新到旧排序    | 返回包含各会话完整消息的副本，不自动按用户过滤                               |
-| `setSystemPrompt(sessionId, prompt)`                                | 替换会话中的 System 消息                       | 空字符串移除系统提示；会话不存在返回 `false`                               |
-| `clearMessages(sessionId)`                                          | 清空指定会话的非 System 消息                   | 保留会话和系统提示，递增版本；会话不存在返回 `false`                       |
-| `deleteSession(sessionId)`                                          | 删除指定会话及全部消息                         | 删除成功返回 `true`；不存在返回 `false`                                  |
-| `updateSessionTimestamp(sessionId)`                                 | 显式更新最近活动时间                           | 会话不存在返回 `false`；普通查询不会更新该时间                             |
-| `clearSessions()`                                                   | 清空管理器中的全部会话                         | 不重置 ID 生成序号                                                           |
-| `getSessionCount()`                                                 | 查询当前会话数量                               | 返回 `std::size_t`                                                         |
-| `generateSessionId()`、`generateMessageId()`                      | 单独生成 ID                                    | 静态方法，仅生成标识，不创建记录                                             |
+| 接口                                                                  | 做的工作                                           | 返回值或注意事项                                                             |
+| --------------------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `createSession(userId, modelConfigId, title, systemPrompt)`         | 创建会话；非空系统提示保存为首条 System 消息       | 返回新会话 ID，后两个参数默认为空                                            |
+| `getSession(sessionId)`                                             | 查询会话及完整消息                                 | 返回 `std::optional<Session>` 快照；不存在为 `std::nullopt`              |
+| `addMessage(sessionId, message, modelConfig)`                       | 追加单条消息                                       | 内部调用 `addMessages`，会话不存在返回 `false`                           |
+| `addMessages(sessionId, messages, modelConfig, expectedGeneration)` | 按原顺序追加一批消息，补充缺失信息并按 ID 去重     | 会话不存在或指定版本不匹配返回 `false`；版本参数默认不检查                 |
+| `getMessages(sessionId)`                                            | 查询完整消息列表                                   | 返回 `std::optional<std::vector<Message>>` 快照；不存在为 `std::nullopt` |
+| `getAllSessions()`                                                  | 查询本管理器已创建或恢复的会话，按更新时间降序排列 | 返回包含完整消息的副本；持久化模式读取这些会话的最新记录                     |
+| `getSessions(userId)`                                               | 查询指定用户的会话概要                             | 按更新时间降序、ID 升序排列，`messages` 为空                               |
+| `restoreSession(sessionId)`                                         | 按原 ID、时间和版本恢复数据库会话到内存            | 不存在返回 `false`；内存模式只检查记录是否存在                             |
+| `setSystemPrompt(sessionId, prompt)`                                | 替换会话中的 System 消息                           | 空字符串移除系统提示；会话不存在返回 `false`                               |
+| `updateSessionTitle(sessionId, title)`                              | 修改标题并刷新活动时间                             | 会话不存在返回 `false`                                                     |
+| `clearMessages(sessionId)`                                          | 清空指定会话的非 System 消息                       | 保留会话和系统提示，递增版本；会话不存在返回 `false`                       |
+| `deleteSession(sessionId)`                                          | 删除指定会话及全部消息                             | 删除成功返回 `true`；不存在返回 `false`                                  |
+| `updateSessionTimestamp(sessionId)`                                 | 显式更新最近活动时间                               | 会话不存在返回 `false`；普通查询不会更新该时间                             |
+| `clearSessions()`                                                   | 清空纯内存模式的全部会话                           | 持久化模式须使用带用户 ID 的重载；不重置 ID 生成序号                         |
+| `clearSessions(userId)`                                             | 清空指定用户的会话及消息                           | 同步内存和数据库，不影响其他用户                                             |
+| `getSessionCount()`                                                 | 查询本管理器已创建或恢复且仍存在的会话数量         | 返回 `std::size_t`；完整用户列表使用 `getSessions(userId)`               |
+| `generateSessionId()`、`generateMessageId()`                      | 单独生成 ID                                        | 静态方法，仅生成标识，不创建记录                                             |
 
 ### 9.3 与 LLMProvider 配合使用
 
@@ -1552,7 +1556,7 @@ Assistant：结合工具结果生成的最终回复
 
 ### 9.5 并发访问与旧请求处理
 
-内部使用一把 `std::shared_mutex` 保护会话映射和消息。查询使用读锁，新增、修改、清空和删除使用写锁；消息副本的字段准备、ID 生成及会话列表排序放在锁外。管理器不在持锁期间发送模型请求或执行工具。
+内部使用一把 `std::shared_mutex` 保护会话映射和消息。查询使用读锁，新增、修改、清空和删除使用写锁；消息副本的字段准备、ID 生成及会话列表排序放在锁外。
 
 **清空消息时的版本检查**
 
@@ -1570,3 +1574,120 @@ Provider 读取历史时同时记录 `Session::generation`，保存时通过 `ex
 - 并发请求使用各自开始时的历史，尚未完成的回复对彼此不可见；有上下文先后依赖时，应等待上一轮完成再发送下一轮。
 - 切换模型或绑定会话不会改变已开始请求的归属；其结果仍保存到原会话，原会话已清空或删除时不再写回。
 - 调用期间入参须保持有效且不被其他线程修改；销毁管理器及 Provider 前须等待相关调用结束。
+
+## 10. DataManager 数据持久化
+
+对应 `SDK/include/DataManager.hpp`、`SDK/src/DataManager.cpp` 和 `SDK/schema.sql`。
+`DataManager` 使用 SQLite 保存会话和完整历史消息，负责数据库连接、读写和事务；`SessionManager` 负责会话管理、ID 生成及消息信息补充，`LLMProvider` 负责模型请求、协议转换和工具执行。
+
+启用持久化后，消息沿已有调用链保存：
+
+```text
+LLMProvider：生成本轮 User / Assistant / Tool 消息链
+SessionManager：补充缺失信息，检查版本并按消息 ID 去重
+DataManager：在同一个事务中追加消息、分配顺序号并更新会话信息
+```
+
+### 10.1 数据库与保存内容
+
+构造 `DataManager` 时打开或创建数据库，并创建必要的数据表和索引；再次打开已有数据库会保留原数据。默认文件为 `SDK/DBFiles/modelbridge.db`，也可传入自定义路径；对象销毁时释放连接。
+
+| 数据表 / 字段                            | 做的工作                   | 当前实现的处理                                                        |
+| ---------------------------------------- | -------------------------- | --------------------------------------------------------------------- |
+| `sessions`                             | 保存会话信息               | 包括 ID、所属用户、最近模型标识、标题、创建及活动时间、`generation` |
+| `messages`                             | 保存完整消息               | 保存第 9.1 节列出的全部 `Message` 字段，关联所属会话                |
+| `position`                             | 记录会话内的消息顺序       | 数据库内部字段，读取时按此排序，不按消息创建时间重排                  |
+| `toolCalls`                            | 保存完整工具调用数组       | 使用 JSON 文本保存，保留调用顺序及原始参数字符串                      |
+| `reasoningContent`、`protocolData`   | 保存思考内容和原生协议数据 | 原样保存字符串，包括签名及协议回放所需的数据                          |
+| `reasoningEffort`、`thinkingEnabled` | 保存当时的思考设置         | 区分未设置、空字符串及显式 `false`                                  |
+
+同一会话内的 `messageId` 唯一，重复提交跳过已存消息，不覆盖旧内容。消息通过外键关联会话，删除会话时一并删除其消息。连接配置、API Key 和工具函数实现不存入数据库，重新聊天时仍由调用方初始化和注册。
+
+建表语句统一保存在 `SDK/schema.sql`，CMake 通过 `SDK/src/DataManagerSchema.hpp.in` 将其生成到构建目录中的头文件，再编入 SDK；程序运行时无需查找源码目录中的 SQL 文件。
+
+### 10.2 主要接口
+
+日常聊天通过 `SessionManager` 使用持久化。直接调用 `DataManager` 时，传入的会话和消息应已准备好 ID、时间及模型信息。
+
+| 接口                                                    | 做的工作                         | 返回值或注意事项                                                     |
+| ------------------------------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| `DataManager(databasePath)`                           | 打开数据库并建表                 | 路径为空使用默认文件；初始化失败抛出异常                             |
+| `createSession(session)`                              | 保存新会话及初始消息             | 一个事务完成；重复会话 ID 抛出异常                                   |
+| `updateSession(session)`                              | 更新标题、最近模型标识和活动时间 | 不覆盖历史、创建时间、所属用户或版本；不存在返回 `false`           |
+| `appendMessage(...)`、`appendMessages(...)`         | 追加单条或一批完整消息           | 返回 `Success`、`NotFound` 或 `VersionMismatch`                |
+| `getSession(sessionId)`、`getMessages(sessionId)`   | 读取会话或完整历史               | 不存在返回 `std::nullopt`；查询不更新活动时间                      |
+| `getSessions(userId)`                                 | 查询指定用户的会话概要           | 更新时间降序、ID 升序排列，不加载消息正文                            |
+| `setSystemPrompt(sessionId, prompt, updatedAt)`       | 替换 System 消息                 | `prompt` 为 `std::optional<Message>`，空值表示移除；其他历史保留 |
+| `updateSessionTimestamp(sessionId, updatedAt)`        | 单独更新活动时间                 | 不存在返回 `false`                                                 |
+| `clearMessages(sessionId, updatedAt)`                 | 清空非 System 消息               | 保留会话及系统提示，同时递增 `generation`                          |
+| `deleteSession(sessionId)`、`clearSessions(userId)` | 删除会话及其消息                 | 批量删除须明确用户范围，不影响其他用户                               |
+
+`NotFound` 表示会话不存在，`VersionMismatch` 表示请求版本已过期；数据库读写失败抛出异常。
+
+### 10.3 与 SessionManager、LLMProvider 配合使用
+
+**启用持久化并创建会话**
+
+```cpp
+#include "DataManager.hpp"
+#include "LLMProvider.hpp"
+#include "SessionManager.hpp"
+#include <memory>
+#include <stdexcept>
+
+auto data = std::make_shared<modelBridge::DataManager>(); // 也可传入数据库文件路径。
+auto sessions = std::make_shared<modelBridge::SessionManager>(data);
+
+modelBridge::ModelConfig config{};
+config.configId = "local-model";
+config.model.protocol = modelBridge::ApiProtocol::Ollama;
+config.model.provider = modelBridge::ProviderType::Ollama;
+config.model.modelName = "your-local-model:tag"; // 替换为已安装的模型。
+config.baseUrl = "http://127.0.0.1:11434";
+config.timeoutSeconds = 120;
+
+auto sessionId = sessions->createSession("user-1", config.configId, "C++ 学习", "你是一名 C++ 开发工程师。");
+modelBridge::OllamaProvider provider;
+if (!provider.initialize(config))
+    throw std::runtime_error(provider.getLastError());
+if (!provider.bindSession(sessions, sessionId))
+    throw std::runtime_error("会话不存在");
+auto result = provider.sendMessage("解释 Reactor 模型。"); // 本轮消息自动保存到数据库。
+auto history = sessions->getMessages(sessionId); // 包含 System 和完整工具过程。
+```
+
+不传入 `DataManager` 时，`SessionManager` 保持纯内存模式。Provider 未绑定会话时仍使用自身的本地历史，不会自动保存到数据库。
+
+**程序重启后恢复和续聊**
+
+重新打开同一个数据库，先查询用户的会话列表，再使用用户选定的原会话 ID 恢复；不要重新创建会话来代替恢复。以下示例沿用上面的模型配置：
+
+```cpp
+auto data = std::make_shared<modelBridge::DataManager>();
+auto sessions = std::make_shared<modelBridge::SessionManager>(data);
+auto list = sessions->getSessions("user-1"); // 仅概要，供界面显示和选择。
+std::string selectedSessionId = "已保存的会话 ID"; // 使用用户实际选定的 ID。
+if (!sessions->restoreSession(selectedSessionId))
+    throw std::runtime_error("会话不存在");
+
+modelBridge::OllamaProvider provider;
+if (!provider.initialize(config))
+    throw std::runtime_error(provider.getLastError());
+if (!provider.bindSession(sessions, selectedSessionId))
+    throw std::runtime_error("会话不存在");
+// 如需继续执行工具，在发送前通过 setTools 注册工具定义和实现。
+auto result = provider.sendMessage("接着上次的内容，它适合哪些场景？");
+```
+
+恢复时保留原会话和消息的 ID、时间、消息顺序及版本。切换模型不会修改已存消息的模型快照，后续追加的消息使用本次请求的模型与思考设置。
+
+### 10.4 事务并发与失败
+
+内部使用单个 SQLite 连接和一把 `std::mutex`，覆盖一次完整数据库操作或事务；与 `SessionManager` 配合时，锁顺序固定为会话锁、数据库锁。
+
+- 新建会话及初始消息、整轮消息追加、系统提示替换和清空历史分别使用事务；失败时回滚，避免保存半条消息链或只更新会话信息。
+- 追加消息、分配顺序号、更新最近模型标识和活动时间在同一个事务中完成；空列表或全部重复消息不更新会话信息。
+- `generation` 检查与消息写入在同一个事务中完成。清空或删除后，旧请求不能恢复已移除的历史；切换绑定后，请求仍保存到原会话。
+- 普通及流式回复均在完整消息链保存后返回；流式的完成回调在保存之后触发。数据库保存失败会抛出异常，不发送完成通知。
+- 首个请求失败时不保存孤立的 User 消息；工具执行后若后续请求失败，已经完成的消息和工具结果仍保存，未完成的响应不保存。
+- 销毁对象前须等待相关调用结束。
