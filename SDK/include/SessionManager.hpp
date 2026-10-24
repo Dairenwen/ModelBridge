@@ -1,13 +1,15 @@
 #pragma once
 #include "Common.hpp"
 #include <cstddef>
+#include <memory>
 #include <shared_mutex>
 #include <unordered_map>
 
 namespace modelBridge
 {
+    class DataManager;
     /**
-     * @brief 在内存中管理多组会话及其完整消息，不负责模型请求和数据库存储。
+     * @brief 管理多组会话及其完整消息，可通过 DataManager 启用 SQLite 持久化。
      * 先创建会话，再调用 Provider；一个管理器可保存多个用户的会话
      * 内部使用一把读写锁保护会话数据，查询返回副本，可与增删操作并发调用。
      * 调用期间入参须保持有效且不被其他线程修改；对象销毁前须等待所有调用结束。
@@ -15,6 +17,22 @@ namespace modelBridge
     class SessionManager
     {
     public:
+        /** @brief 创建管理器。@param dataManager 可选存储对象；空值保持纯内存模式。
+         * 数据库异常向调用方传播；锁顺序固定为会话锁、数据库锁。
+         */
+        explicit SessionManager(std::shared_ptr<DataManager> dataManager = nullptr);
+
+        /** @brief 按原 ID、时间和版本加载数据库会话到内存。
+         * @param sessionId 待恢复的会话 ID。@return 不存在返回 false。
+         * 内存模式只检查该会话是否存在；持久化模式重新读取完整数据。
+         */
+        bool restoreSession(const std::string &sessionId);
+
+        /** @brief 获取指定用户的会话概要，messages 为空，不读取完整历史。
+         * @param userId 明确的用户范围。@return 按更新时间降序、ID 升序排列的列表。
+         */
+        std::vector<Session> getSessions(const std::string &userId) const;
+
         /**
          * @brief 创建一个空会话，可在模型连接初始化之前调用。
          * @param userId 会话所属用户 ID。
@@ -66,10 +84,16 @@ namespace modelBridge
         std::optional<std::vector<Message>> getMessages(const std::string &sessionId) const;
 
         /**
-         * @brief 获取所有会话的副本，按最近更新时间从新到旧排列。
+         * @brief 获取内存已创建或恢复的会话副本，按最近更新时间从新到旧排列。
+         * 持久化模式读取这些会话的最新记录；完整用户列表使用 getSessions(userId)。
          * @return 会话列表；没有会话时返回空列表，修改副本不影响管理器。
          */
         std::vector<Session> getAllSessions() const;
+
+        /** @brief 更新会话标题并刷新活动时间。
+         * @param sessionId 会话 ID。@param title 新标题。@return 不存在返回 false。
+         */
+        bool updateSessionTitle(const std::string &sessionId, const std::string &title);
 
         /**
          * @brief 删除指定会话及其所有消息。
@@ -86,13 +110,19 @@ namespace modelBridge
         bool updateSessionTimestamp(const std::string &sessionId);
 
         /**
-         * @brief 清空内存中的所有会话及其消息，不重置 ID 生成序号。
+         * @brief 清空纯内存模式的全部会话，不重置 ID 生成序号。
+         * 持久化模式须使用带 userId 的重载，避免无范围删除数据库记录。
          * @return 无。
          */
         void clearSessions();
 
+        /** @brief 删除指定用户在内存和数据库中的全部会话。
+         * @param userId 明确的用户范围，不影响其他用户。
+         */
+        void clearSessions(const std::string &userId);
+
         /**
-         * @brief 获取当前保存的会话总数。
+         * @brief 获取本管理器已创建或恢复且仍存在的会话数量。
          * @return 会话数量。
          */
         std::size_t getSessionCount() const;
@@ -110,8 +140,14 @@ namespace modelBridge
         static std::string generateMessageId();
 
     private:
+        std::shared_ptr<DataManager> dataManager;
         mutable std::shared_mutex stateMutex; ///< 只在读取或更新内存数据时持锁。
         std::unordered_map<std::string, Session> sessions; ///< 会话 ID 到会话数据的映射。
+
+        /** @brief 在已持有写锁时查找会话；持久化模式同步读取数据库快照。
+         * @return 内存记录指针；不存在返回 nullptr，不生成新会话或新 ID。
+         */
+        Session *findSessionLocked(const std::string &sessionId);
 
         /**
          * @brief 组合时间戳、随机标识和递增序号生成 ID。

@@ -11,6 +11,12 @@ find_package(Threads REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(jsoncpp CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(SQLite3 REQUIRED)
+
+# 使用同一份带注释的 SQL 初始化数据库，避免运行时查找源码文件。
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema.sql")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/schema.sql" MODELBRIDGE_SCHEMA_SQL)
+configure_file(src/DataManagerSchema.hpp.in generated/DataManagerSchema.hpp @ONLY)
 
 file(GLOB_RECURSE SDK_HEADERS CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
@@ -24,11 +30,13 @@ list(REMOVE_ITEM SDK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 add_library(modelbridge_sdk STATIC ${SDK_SOURCES} ${SDK_HEADERS})
 target_include_directories(modelbridge_sdk
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+           ${SQLite3_INCLUDE_DIRS}
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 target_compile_definitions(modelbridge_sdk PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(modelbridge_sdk
-    PUBLIC spdlog::spdlog Threads::Threads JsonCpp::JsonCpp
+    PUBLIC spdlog::spdlog Threads::Threads JsonCpp::JsonCpp ${SQLite3_LIBRARIES}
     PRIVATE OpenSSL::SSL OpenSSL::Crypto
 )
 
